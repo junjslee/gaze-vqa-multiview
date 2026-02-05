@@ -1,0 +1,16 @@
+#!/bin/bash
+#SBATCH --account=bfga-delta-gpu
+#SBATCH --partition=gpuA40x4
+#SBATCH --time=24:00:00        # Request 24 hours
+#SBATCH --nodes=1
+#SBATCH --gpus-per-node=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64g
+#SBATCH --job-name=gaze_vqa
+#SBATCH --output=logs_%j.txt   # Saves print statements to this file
+
+# Load modules or go to directory
+cd /work/nvme/bfga/jlee65/gaze_vqa_project
+
+# Run your containerized script
+apptainer exec --nv jun_fm.sif python ncsa_gaze_vqa.py

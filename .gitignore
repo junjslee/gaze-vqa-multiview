@@ -1,0 +1,7 @@
+__init__.py
+MVGT_Dataset.zip
+__pycache__
+checkpoints
+/runs
+third_party
+workflow_diagrams.md
