@@ -5,14 +5,19 @@ import traceback
 import math
 import zipfile
 import copy
-from tqdm import tqdm
 import numpy as np
+
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 from . import state as st
 from .io_utils import ensure_mvgt_zip, zip_list_sequences, zip_read_json, zip_try_image_path, _interleave_sequences_by_split
 from .dataset_utils import normalize_annotations, detect_cameras, cam_anno
 from .sam2_utils import ensure_sam2
-from .vlm import load_qwen
+from .vlm import warmup_vlm, get_vlm_usage_report, write_vlm_usage_report
 from .task1 import build_task1, build_person_descriptor
 from .task2 import build_task2_relative_camera_rotation, load_triangulate_map
 from .task3 import build_task3_binary_per_view
@@ -38,7 +43,7 @@ def generate_benchmark_single():
     ensure_mvgt_zip()
     ensure_sam2()
     if not st.ARGS.skip_vlm:
-        load_qwen()
+        warmup_vlm()
 
     if st.SAVE_DEBUG and st.DEBUG_MANIFEST.exists():
         try:
@@ -146,7 +151,8 @@ def generate_benchmark_single():
         def _collect_task1_debug_images(split, seq, frame_id, anchor_cam):
             if (not st.SAVE_DEBUG) or (not anchor_cam):
                 return []
-            pattern = f"t1_*_{split}_{seq}_{frame_id}_{anchor_cam}"
+            # Only select accepted-task debug dirs (t1_<idx>_*), not failure dumps.
+            pattern = f"t1_[0-9]*_{split}_{seq}_{frame_id}_{anchor_cam}"
             matches = sorted(st.DEBUG_DIR.glob(pattern))
             if not matches:
                 return []
@@ -154,9 +160,11 @@ def generate_benchmark_single():
             ordered = [
                 "anchor_raw_resized.jpg",
                 "anchor_ray.jpg",
+                "anchor_ray_label_prompt.jpg",
                 "masked_crop.jpg",
-                "masked_overlay_crop.jpg",
-                "mask_overlay.jpg",
+                "masked_mask_crop.jpg",
+                "anchor_dot_mask_crop.jpg",
+                "mask_only.jpg",
                 "collage.jpg",
             ]
             imgs = []
@@ -164,6 +172,17 @@ def generate_benchmark_single():
                 p = dbg_dir / name
                 if p.exists():
                     imgs.append(str(p))
+            # Include all per-camera Task1 ray/mask outputs for HTML inspection.
+            for p in sorted(dbg_dir.glob("mv_*_raw.jpg")):
+                imgs.append(str(p))
+            for p in sorted(dbg_dir.glob("mv_*_ray.jpg")):
+                imgs.append(str(p))
+            for p in sorted(dbg_dir.glob("mv_*_mask_only.jpg")):
+                imgs.append(str(p))
+            for p in sorted(dbg_dir.glob("mv_*_masked_crop.jpg")):
+                imgs.append(str(p))
+            for p in sorted(dbg_dir.glob("mv_*_dot_mask_crop.jpg")):
+                imgs.append(str(p))
             return imgs
 
         def _prepare_frame_task(task, accepted=False, debug_images=None):
@@ -203,6 +222,7 @@ def generate_benchmark_single():
                 st.FRAME_STATS["frames_seen"] += 1
 
                 frame_id = fr["frame_id"]
+                st.CURRENT_FRAME_KEY = f"{split}/{seq}/{frame_id}"
                 frame_data = fr["data"]
                 cams = detect_cameras(frame_data)
                 if not cams:
@@ -469,11 +489,41 @@ def generate_benchmark_single():
             if stop_frames:
                 break
 
+    st.CURRENT_FRAME_KEY = None
+
+    vlm_usage_report = get_vlm_usage_report()
+    vlm_usage_path = None
+    if vlm_usage_report is not None:
+        vlm_usage_path = write_vlm_usage_report(st.VLM_USAGE_JSON)
+        if vlm_usage_path:
+            st.logger.info(f"Saved VLM usage report: {vlm_usage_path}")
+
+    bundle_skip_stats = None
+    if st.REQUIRE_ALL_TASKS_PER_FRAME:
+        accepted = int(counts.get("bundle", 0))
+        skipped = int(st.REJECT_STATS.get("frame_incomplete_bundle", 0))
+        attempted = accepted + skipped
+        skip_rate = (float(skipped) / float(attempted)) if attempted > 0 else None
+        bundle_skip_stats = {
+            "attempted_frames_with_bundle_requirement": attempted,
+            "accepted_frame_bundles": accepted,
+            "skipped_due_to_task_failure": skipped,
+            "skip_rate_among_attempted": skip_rate,
+            "first_failed_task_counts": {
+                "task1": int(st.REJECT_STATS.get("frame_missing_task1", 0)),
+                "task2": int(st.REJECT_STATS.get("frame_missing_task2", 0)),
+                "task3": int(st.REJECT_STATS.get("frame_missing_task3", 0)),
+                "task4": int(st.REJECT_STATS.get("frame_missing_task4", 0)),
+            },
+        }
+
     partial = {
         "meta": {
             "dataset": "MVGT",
             "protocol": "Haozhen-style Gaze-VQA benchmark v7.4 (Single-process)",
-            "qwen_model": None if st.ARGS.skip_vlm else st.QWEN_MODEL_ID,
+            "vlm_provider": None if st.ARGS.skip_vlm else st.VLM_PROVIDER,
+            "vlm_model": None if st.ARGS.skip_vlm else st.VLM_MODEL_ID,
+            "qwen_model": None if st.ARGS.skip_vlm else (st.QWEN_MODEL_ID if st.VLM_PROVIDER == "qwen" else None),
             "input_images_dir": str(st.RAW_IMG_DIR),
             "debug_dir": str(st.DEBUG_DIR) if st.SAVE_DEBUG else None,
             "targets": {"task1": st.TARGET_TASK1, "task2": st.TARGET_TASK2, "task3": st.TARGET_TASK3, "task4": st.TARGET_TASK4},
@@ -484,6 +534,9 @@ def generate_benchmark_single():
             "require_all_tasks_per_frame": bool(st.REQUIRE_ALL_TASKS_PER_FRAME),
             "task1_conf_threshold": float(st.TASK1_CONF_THRESHOLD),
             "dataset_stats": st.DATASET_STATS if st.DATASET_STATS else None,
+            "vlm_usage_report": vlm_usage_path,
+            "vlm_usage_totals": (vlm_usage_report or {}).get("totals") if vlm_usage_report else None,
+            "bundle_skip_stats": bundle_skip_stats,
         },
         "counts": counts,
         "reject_stats": st.REJECT_STATS,

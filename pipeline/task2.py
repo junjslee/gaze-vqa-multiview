@@ -42,9 +42,13 @@ def find_triangulate_3d_json(zf, split, seq):
         low = p.lower()
         if low.endswith(".json") and "triangulate_3d" in low:
             hits.append(p)
-    if hits:
+    # Safety: if multiple global triangulate files exist and we failed to match
+    # split/seq above, do not guess one arbitrarily.
+    if len(hits) == 1:
         hits.sort()
         return hits[0]
+    if len(hits) > 1:
+        return None
 
     return None
 
@@ -633,6 +637,8 @@ def _task2_axis_plane_diag(centers_map, person_center):
 
 
 def qualitative_body_orientation_desc(image_path, cam_name, scene_type=None):
+    if st.ARGS.skip_vlm:
+        return "Body orientation unavailable because VLM was skipped."
     prompt = prompts.prompt_task2_body_orientation(cam_name, scene_type=scene_type)
     raw = vlm_generate([image_path], prompt, max_new_tokens=40)
     return _first_two_sentences(raw) or "Body orientation unclear."

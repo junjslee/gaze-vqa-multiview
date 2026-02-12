@@ -271,6 +271,92 @@ def overlay_soft_mask_on_image(img_pil, mask_f, alpha=0.45):
     return Image.fromarray(out.astype(np.uint8))
 
 
+def preprocess_segmentation_image_np(img_np):
+    """
+    Optional Task1 preprocessing before SAM2 embedding.
+    Supports:
+    - LAB-L CLAHE
+    - LAB-L bilateral denoising
+    - LAB L/b edge boost blended into L
+    Keeps geometry unchanged and returns RGB uint8 (or grayscale for grayscale input).
+    """
+    if img_np is None:
+        return img_np
+    use_clahe = bool(getattr(st, "TASK1_SEG_USE_CLAHE", False))
+    use_bilateral = bool(getattr(st, "TASK1_SEG_USE_BILATERAL", False))
+    use_edge_boost = bool(getattr(st, "TASK1_SEG_USE_LB_EDGE_BOOST", False))
+    if not (use_clahe or use_bilateral or use_edge_boost):
+        return img_np
+    try:
+        import cv2
+        clip = float(getattr(st, "TASK1_SEG_CLAHE_CLIP", 2.0))
+        tile = max(2, int(getattr(st, "TASK1_SEG_CLAHE_TILE", 8)))
+        bilateral_d = max(1, int(getattr(st, "TASK1_SEG_BILATERAL_D", 9)))
+        if bilateral_d % 2 == 0:
+            bilateral_d += 1
+        bilateral_sigma_color = max(1e-6, float(getattr(st, "TASK1_SEG_BILATERAL_SIGMA_COLOR", 75.0)))
+        bilateral_sigma_space = max(1e-6, float(getattr(st, "TASK1_SEG_BILATERAL_SIGMA_SPACE", 75.0)))
+
+        l_low = int(getattr(st, "TASK1_SEG_EDGE_L_LOW", 30))
+        l_high = int(getattr(st, "TASK1_SEG_EDGE_L_HIGH", 100))
+        b_low = int(getattr(st, "TASK1_SEG_EDGE_B_LOW", 20))
+        b_high = int(getattr(st, "TASK1_SEG_EDGE_B_HIGH", 50))
+        l_low = max(0, min(255, l_low))
+        l_high = max(0, min(255, l_high))
+        b_low = max(0, min(255, b_low))
+        b_high = max(0, min(255, b_high))
+        if l_high < l_low:
+            l_low, l_high = l_high, l_low
+        if b_high < b_low:
+            b_low, b_high = b_high, b_low
+        edge_alpha = float(getattr(st, "TASK1_SEG_EDGE_BOOST_ALPHA", 0.2))
+        edge_alpha = max(0.0, min(1.0, edge_alpha))
+        edge_dilate_iter = max(0, int(getattr(st, "TASK1_SEG_EDGE_DILATE_ITER", 1)))
+
+        arr = np.asarray(img_np, dtype=np.uint8)
+        if arr.ndim == 2:
+            gray = arr
+            if use_clahe:
+                clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile))
+                gray = clahe.apply(gray)
+            if use_bilateral:
+                gray = cv2.bilateralFilter(gray, bilateral_d, bilateral_sigma_color, bilateral_sigma_space)
+            if use_edge_boost:
+                edges = cv2.Canny(gray, l_low, l_high)
+                if edge_dilate_iter > 0:
+                    kernel = np.ones((3, 3), dtype=np.uint8)
+                    edges = cv2.dilate(edges, kernel, iterations=edge_dilate_iter)
+                if edge_alpha > 0.0:
+                    gray = cv2.addWeighted(gray, 1.0, edges, edge_alpha, 0.0)
+            return gray.astype(np.uint8)
+
+        lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+
+        if use_clahe:
+            clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile))
+            l = clahe.apply(l)
+
+        if use_bilateral:
+            l = cv2.bilateralFilter(l, bilateral_d, bilateral_sigma_color, bilateral_sigma_space)
+
+        if use_edge_boost:
+            edges_l = cv2.Canny(l, l_low, l_high)
+            edges_b = cv2.Canny(b, b_low, b_high)
+            edges = cv2.bitwise_or(edges_l, edges_b)
+            if edge_dilate_iter > 0:
+                kernel = np.ones((3, 3), dtype=np.uint8)
+                edges = cv2.dilate(edges, kernel, iterations=edge_dilate_iter)
+            if edge_alpha > 0.0:
+                l = cv2.addWeighted(l, 1.0, edges, edge_alpha, 0.0)
+
+        lab2 = cv2.merge((l, a, b))
+        out = cv2.cvtColor(lab2, cv2.COLOR_LAB2RGB)
+        return out.astype(np.uint8)
+    except Exception:
+        return img_np
+
+
 def overlay_mask_on_image_neutral(img_pil, mask_u8, dim_outside=0.55):
     img = np.array(img_pil).astype(np.float32)
     mask = (mask_u8 > 0).astype(np.float32)
@@ -519,7 +605,7 @@ def segment_object_on_crop(crop_pil, point_xy, cfg=None):
     if gx < 0 or gy < 0 or gx >= W or gy >= H:
         return None, None, None, None
 
-    predictor.set_image(img_np)
+    predictor.set_image(preprocess_segmentation_image_np(img_np))
 
     use_tight_box = _cfg_get(cfg, "use_tight_box", st.TASK1_USE_TIGHT_BOX)
     point_box_size = _cfg_get(cfg, "point_box_size", st.TASK1_POINT_BOX_SIZE)
@@ -902,7 +988,7 @@ def segment_object_at_gaze(zf, split, seq, cam, frame_id, point_xy_scaled, body_
     img_np = np.array(img_pil)
     H, W = img_np.shape[0], img_np.shape[1]
 
-    predictor.set_image(img_np)
+    predictor.set_image(preprocess_segmentation_image_np(img_np))
 
     gx, gy = float(point_xy_scaled[0]), float(point_xy_scaled[1])
     use_tight_box = _cfg_get(cfg, "use_tight_box", st.TASK1_USE_TIGHT_BOX)

@@ -5,3 +5,6 @@ checkpoints
 /runs
 third_party
 workflow_diagrams.md
+.env
+.env.*
+!.env.example

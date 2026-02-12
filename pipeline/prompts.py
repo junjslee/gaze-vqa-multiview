@@ -93,30 +93,18 @@ def prompt_person_descriptor(scene_type=None):
 
 
 def prompt_target_description_ray(person_desc, anchor_cam, scene_type=None):
-    """Task1: describe gaze target using a ray+dot overlay image."""
+    """Task1: describe gaze target using a ray+arrow overlay image."""
     who = person_ref(person_desc)
     return (
-        f"In {lc(anchor_cam)}, a red line indicates the gaze direction of {lc(who)} and ends at a small red 'dot' (not a red circular object like red tomato) marking the target.\n"
+        f"In {lc(anchor_cam)}, a red line indicates the gaze direction of {lc(who)} and points to the target with a small red arrowhead near the target location.\n"
+        "The arrow marker is intentionally offset a little from the exact target point to avoid covering the object.\n"
         "Describe the specific thing they are looking at in 1-2 sentences.\n"
         "Use 'on' ONLY if the object is clearly resting on a surface (visible contact) and realistic. "
         "If it only appears aligned in 2D but is farther away (e.g., a wall-mounted air conditioner above a foosball table), do NOT say 'on'.\n"
-        "If the dot lands on a small item resting on a larger item as a surface, describe it as '<small> on <large>' (e.g., 'book on table').\n"
+        "If the marker points to a small item resting on a larger item as a surface, describe it as '<small> on <large>' (e.g., 'book on table').\n"
         "Be concrete (type + color/material/edge shape/size if visible).\n"
         "If it is furniture, just name the type (table/chair/stool/armchair/sofa/desk/bookshelf/cabinet/etc).\n"
-        "Do NOT mention the red dot orred line."
-    )
-
-
-def prompt_target_description_dot(person_desc, anchor_cam, scene_type=None):
-    """Task1: describe gaze target using red dot-only overlay on the full image."""
-    who = person_ref(person_desc)
-    return (
-        f"In {lc(anchor_cam)}, a small red 'dot' (not a red circular object like red tomato) marks the gaze target of {lc(who)}.\n"
-        "Describe the specific thing at the dot in 1-2 sentences.\n"
-        "Use 'on' ONLY if the object is clearly resting on a surface. If alignment could be depth, avoid 'on'.\n"
-        "Be concrete (type + color/material/edge shape/size if visible).\n"
-        "Name the classification/type of object (e.g., If it is furniture, name the type—table/chair/stool/armchair/sofa/desk/bookshelf/cabinet/etc).\n"
-        "Do NOT mention the red dot."
+        "Do NOT mention the red arrow marker or red line."
     )
 
 
@@ -129,7 +117,7 @@ def prompt_distill_object_phrase(target_description, scene_type=None):
         "- 1 to 4 words\n"
         "- No verbs, no 'the'\n"
         "- Avoid generic terms like 'furniture' or 'object', 'thing', 'square/box'\n"
-        "- Do not mention dots, lines, rays, or overlays\n"
+        "- Do not mention dots, arrows, lines, rays, or overlays\n"
         "- If the description is ambiguous, output your best concrete guess\n"
         "- Use 'on' ONLY if contact is visually obvious; avoid 'on' for 2D alignment (e.g., wall AC above a table), no vague objects should be mentioned even if it's on it\n"
         "- If a small item (clearly distinguishable) sits on a larger surface, you may return '<small> on <large>'\n"
@@ -163,7 +151,7 @@ def prompt_masked_object_detailed(scene_type=None):
         "Rules: 2-5 words. No verbs. No punctuation.\n"
         "Include color/material if clearly visible (e.g., 'red mug', 'wooden chair', 'plastic plate', 'glass plate', 'blue cup', 'white bottle', 'metal faucet').\n"
         "Avoid broad surfaces like floor/ceiling/wall and generic patterns/textures.\n"
-        "Be specific (avoid generic terms like 'object', 'thing', 'pattern')."
+        "Be specific (avoid generic terms like 'object', 'thing', 'pattern', 'fabric')."
     )
 
 
@@ -228,6 +216,50 @@ def prompt_task1_pose_check(person_desc, obj_label, scene_type=None):
         f"In this image, is {lc(who)} actually looking at the '{lc(obj_label)}'?\n"
         "Use head/torso orientation and spatial position. If unclear, answer UNCLEAR.\n"
         "Answer ONLY with YES, NO, or UNCLEAR."
+    )
+
+
+def prompt_task1_semantic_arbiter(
+    person_desc,
+    anchor_cam,
+    candidate_labels,
+    scene_type=None,
+    mask_area_ratio=None,
+    ray_available=True,
+):
+    """
+    Task1: disagreement-focused semantic arbiter.
+    Uses multi-cue labels + scene context to pick a final object phrase.
+    """
+    who = person_ref(person_desc)
+    lines = []
+    for key, val in (candidate_labels or {}).items():
+        if val:
+            lines.append(f"- {key}: {lc(val)}")
+    cand_block = "\n".join(lines) if lines else "- none"
+    mar_txt = "N/A" if mask_area_ratio is None else f"{float(mask_area_ratio):.4f}"
+    ray_txt = "available" if ray_available else "not available"
+    return (
+        "You are resolving conflicting gaze-target labels for dataset quality.\n"
+        "Interpret the images as follows:\n"
+        "1) segmented mask crop at gaze target\n"
+        "2) same crop with target dot\n"
+        "3) cue-rich full image (person bbox + gaze ray + mask)\n"
+        "4) full raw scene context\n"
+        "Goal: return the most accurate concrete object identity that "
+        f"{lc(who)} is looking at in {lc(anchor_cam)}.\n"
+        "Prefer full object identity over partial fragments. "
+        "Use scene context to disambiguate tiny patches.\n"
+        "Avoid generic words ('object', 'thing', 'furniture') and avoid mentions of overlays/rays/dots.\n"
+        "Use 'on' only when true physical support is visually clear.\n"
+        f"Mask area ratio: {mar_txt}. Ray cue: {ray_txt}.\n"
+        "Candidate labels:\n"
+        f"{cand_block}\n\n"
+        "Think step-by-step internally, but output ONLY these lines:\n"
+        "FINAL_LABEL: <1-4 words>\n"
+        "DECISION: <KEEP|SWITCH_MASK|SWITCH_DOT|SWITCH_RAY|SWITCH_MV|REFINE|UNSURE>\n"
+        "CONFIDENCE: <HIGH|MEDIUM|LOW>\n"
+        "RATIONALE: <max 14 words>"
     )
 
 

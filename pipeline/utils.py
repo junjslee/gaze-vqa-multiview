@@ -1,5 +1,6 @@
 import json
 import os
+import html as html_lib
 from pathlib import Path
 from PIL import Image
 
@@ -109,40 +110,76 @@ def write_frame_debug(split, seq, frame_id, tasks):
             rel = os.path.relpath(Path(p), start=frame_dir)
         except Exception:
             rel = str(p)
+        rel_esc = html_lib.escape(rel, quote=True)
         return (
             f'<div style="display:inline-block; text-align:center; margin:6px;">'
-            f'<a href="{rel}" target="_blank">open</a><br>'
-            f'<img src="{rel}" style="max-width: 420px; margin: 6px;">'
+            f'<a href="{rel_esc}" target="_blank">open</a><br>'
+            f'<img src="{rel_esc}" style="max-width: 420px; margin: 6px;">'
             f'</div>'
         )
 
-    html = [
+    html_lines = [
         "<html><head><meta charset='utf-8'><title>Frame Debug</title></head><body>",
-        f"<h2>Frame: {split}/{seq} {frame_id}</h2>",
+        f"<h2>Frame: {html_lib.escape(str(split))}/{html_lib.escape(str(seq))} {html_lib.escape(str(frame_id))}</h2>",
         "<p><i>Note: This view lists only tasks that were accepted (written into benchmark_gazevqa.json).</i></p>",
     ]
     for t in tasks:
-        html.append(f"<h3>Task {t.get('task_id')}</h3>")
-        html.append(f"<p><b>Accepted:</b> {t.get('_accepted')}</p>")
-        html.append(f"<p><b>Question:</b> {t.get('question','')}</p>")
-        html.append(f"<p><b>Answer:</b> {t.get('answer','')}</p>")
-        html.append(f"<p><b>Reasoning:</b> {t.get('reasoning','')}</p>")
+        html_lines.append(f"<h3>Task {html_lib.escape(str(t.get('task_id')))}</h3>")
+        html_lines.append(f"<p><b>Accepted:</b> {html_lib.escape(str(t.get('_accepted')))}</p>")
+        html_lines.append(f"<p><b>Question:</b> {html_lib.escape(str(t.get('question', '')))}</p>")
+        html_lines.append(f"<p><b>Answer:</b> {html_lib.escape(str(t.get('answer', '')))}</p>")
+        html_lines.append(f"<p><b>Reasoning:</b> {html_lib.escape(str(t.get('reasoning', '')))}</p>")
+        meta = t.get("meta", {}) if isinstance(t.get("meta"), dict) else {}
+        if t.get("task_id") == 1 and meta:
+            html_lines.append(f"<p><b>Task1 anchor camera (mask-only view):</b> {html_lib.escape(str(meta.get('camera_id', '')))}</p>")
+            html_lines.append(f"<p><b>Task1 anchor label:</b> {html_lib.escape(str(meta.get('anchor_canonical_object', '')))}</p>")
+            html_lines.append(f"<p><b>Task1 final canonical label:</b> {html_lib.escape(str(meta.get('canonical_object', '')))}</p>")
+            html_lines.append(f"<p><b>Task1 segmentation_try:</b> {html_lib.escape(str(meta.get('segmentation_try', '')))}</p>")
+            html_lines.append(f"<p><b>Task1 canonical_mode:</b> {html_lib.escape(str(meta.get('canonical_mode', '')))}</p>")
+            html_lines.append(f"<p><b>Task1 ray_available:</b> {html_lib.escape(str(meta.get('ray_available', '')))}</p>")
+            mv_weights = meta.get("multiview_weight_map")
+            if isinstance(mv_weights, dict) and mv_weights:
+                html_lines.append(
+                    f"<p><b>Task1 multiview weights:</b> {html_lib.escape(json.dumps(mv_weights, sort_keys=True))}</p>"
+                )
+            mv_coords = meta.get("multiview_coords_scaled")
+            if isinstance(mv_coords, dict) and mv_coords:
+                html_lines.append(
+                    f"<p><b>Task1 multiview coords (scaled):</b> {html_lib.escape(json.dumps(mv_coords, sort_keys=True))}</p>"
+                )
+            label_flow = meta.get("label_flow")
+            if isinstance(label_flow, list) and label_flow:
+                html_lines.append(
+                    f"<p><b>Task1 label_flow:</b> {html_lib.escape(json.dumps(label_flow, ensure_ascii=False))}</p>"
+                )
+            anchor_scores = meta.get("anchor_candidate_scores")
+            if isinstance(anchor_scores, dict) and anchor_scores:
+                ordered = sorted(
+                    anchor_scores.items(),
+                    key=lambda kv: float((kv[1] or {}).get("score", -1.0)),
+                    reverse=True,
+                )
+                rank_txt = ", ".join(
+                    f"{cam}:{float((info or {}).get('score', -1.0)):.3f}"
+                    for cam, info in ordered
+                )
+                html_lines.append(f"<p><b>Task1 anchor ranking:</b> {html_lib.escape(rank_txt)}</p>")
         imgs = t.get("input_images", [])
         if imgs:
-            html.append("<div>")
+            html_lines.append("<div>")
             for ent in imgs:
                 p = ent.get("image")
                 if p:
-                    html.append(img_tag(p))
-            html.append("</div>")
+                    html_lines.append(img_tag(p))
+            html_lines.append("</div>")
         dbg_imgs = t.get("_debug_images", [])
         if dbg_imgs:
-            html.append("<div><b>Debug images:</b><br>")
+            html_lines.append("<div><b>Debug images:</b><br>")
             for p in dbg_imgs:
-                html.append(img_tag(p))
-            html.append("</div>")
-    html.append("</body></html>")
+                html_lines.append(img_tag(p))
+            html_lines.append("</div>")
+    html_lines.append("</body></html>")
 
     html_path = frame_dir / "tasks.html"
     with open(html_path, "w") as f:
-        f.write("\n".join(html))
+        f.write("\n".join(html_lines))

@@ -26,7 +26,7 @@ def build_task3_binary_per_view(zf, split, seq, frame_id, cams_subset, obj_label
         input_images.append({"cam": cam, "image": p})
 
         if use_gt and st.TASK3_USE_GT_VISIBILITY_IF_PRESENT:
-            v = parse_visibility(per_cam[cam])
+            v = parse_visibility(per_cam.get(cam, {}))
             if v is True:
                 per_view[cam] = "YES"
             elif v is False:
@@ -36,6 +36,8 @@ def build_task3_binary_per_view(zf, split, seq, frame_id, cams_subset, obj_label
         else:
             per_view[cam], _ = object_visible_yesno_vlm(p, obj_label, scene_type=split)
 
+    used_cams = [cam for cam in cams_subset if cam in per_view]
+
     fallback_used = False
     if len(per_view) < st.TASK3_NUM_VIEWS_MIN:
         st.REJECT_STATS["t3_not_enough_views"] += 1
@@ -43,31 +45,40 @@ def build_task3_binary_per_view(zf, split, seq, frame_id, cams_subset, obj_label
             fallback_used = True
             st.logger.info(
                 f"[Task3] fallback to 2 views split={split} seq={seq} frame={frame_id} "
-                f"views={list(per_view.keys())}"
+                f"views={used_cams}"
             )
         else:
             return None
 
     any_yes = any(v == "YES" for v in per_view.values())
+    all_yes = bool(per_view) and all(v == "YES" for v in per_view.values())
 
     if not any_yes:
         answer = f"Gaze target: {obj_label}. " + st.TASK3_OUTSIDE_SUMMARY.format(person_desc=person_desc)
     else:
-        parts = [f"{cam}: {per_view[cam]}" for cam in cams_subset if cam in per_view]
+        parts = [f"{cam}: {per_view[cam]}" for cam in used_cams]
         answer = f"Gaze target: {obj_label}. " + ". ".join(parts) + "."
 
     question = prompts.prompt_task3_question(person_desc, obj_label, scene_type=split)
 
-    reasoning = (
-        f"Gaze target is {obj_label}. "
-        "At least one provided view contains the target object, so visibility differs by camera."
-        if any_yes else
-        f"Gaze target is {obj_label}. "
-        "None of the provided views contain the target object, so the gaze target lies outside these views."
-    )
+    if not any_yes:
+        reasoning = (
+            f"Gaze target is {obj_label}. "
+            "None of the provided views contain the target object, so the gaze target lies outside these views."
+        )
+    elif all_yes:
+        reasoning = (
+            f"Gaze target is {obj_label}. "
+            "The target object is visible in all provided views."
+        )
+    else:
+        reasoning = (
+            f"Gaze target is {obj_label}. "
+            "The target object is visible in some provided views but not others."
+        )
 
     from .utils import make_id
-    obj_id = make_id("t3", split, seq, frame_id, obj_label, ",".join(cams_subset))
+    obj_id = make_id("t3", split, seq, frame_id, obj_label, ",".join(used_cams))
 
     return {
         "task_id": 3,
@@ -75,13 +86,13 @@ def build_task3_binary_per_view(zf, split, seq, frame_id, cams_subset, obj_label
         "answer": answer,
         "reasoning": reasoning,
         "meta": {
-            "camera_id": ",".join(cams_subset),
+            "camera_id": ",".join(used_cams),
             "object_id": obj_id,
             "binary_per_view": per_view,
             "fallback_min_views_used": fallback_used,
-            "views_used": list(per_view.keys())
+            "views_used": used_cams,
         },
-        "input_cams": cams_subset,
+        "input_cams": used_cams,
         "input_images": input_images,
         "scene": split.lower(),
         "timestamp": frame_id,

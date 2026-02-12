@@ -5,11 +5,66 @@ import time
 import random
 import logging
 import sys
+import re
 from pathlib import Path
 import warnings
 import numpy as np
 
 warnings.filterwarnings("ignore")
+
+
+def _strip_wrapped_quotes(s):
+    s = str(s).strip()
+    if len(s) >= 2 and ((s[0] == "'" and s[-1] == "'") or (s[0] == '"' and s[-1] == '"')):
+        return s[1:-1]
+    return s
+
+
+def _load_env_file(path: Path):
+    try:
+        text = path.read_text()
+    except Exception:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        val = val.strip()
+        if val and val[0] in ("'", '"'):
+            val = _strip_wrapped_quotes(val)
+        elif " #" in val:
+            val = val.split(" #", 1)[0].strip()
+        os.environ.setdefault(key, val)
+
+
+def _bootstrap_env():
+    # Load .env before argparse defaults are materialized.
+    candidates = []
+    env_file = os.environ.get("GAZEVQA_ENV_FILE", "").strip()
+    if env_file:
+        candidates.append(Path(env_file).expanduser())
+    candidates.append(Path.cwd() / ".env")
+    candidates.append(Path(__file__).resolve().parents[1] / ".env")
+
+    seen = set()
+    for p in candidates:
+        rp = str(p.resolve()) if p.exists() else str(p)
+        if rp in seen:
+            continue
+        seen.add(rp)
+        if p.exists():
+            _load_env_file(p)
+
+
+_bootstrap_env()
 
 
 def parse_args():
@@ -66,9 +121,46 @@ def parse_args():
     g_models.add_argument("--qwen_model", type=str,
                           default=os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct"),
                           help="VLM model id for Qwen (e.g., Qwen/Qwen2.5-VL-7B-Instruct).")
+    # VLM provider routing.
+    g_models.add_argument("--vlm_provider", type=str,
+                          default=os.environ.get("VLM_PROVIDER", "qwen").strip().lower(),
+                          choices=["qwen", "openai", "gemini"],
+                          help="Provider used for all VLM calls: qwen, openai, or gemini.")
+    # Optional provider model override. If empty, provider-specific defaults are used.
+    g_models.add_argument("--vlm_model", type=str,
+                          default=os.environ.get("VLM_MODEL", ""),
+                          help="Model name for selected provider (optional override).")
+    g_models.add_argument("--openai_base_url", type=str,
+                          default=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+                          help="OpenAI API base URL.")
+    g_models.add_argument("--gemini_api_base", type=str,
+                          default=os.environ.get("GEMINI_API_BASE", "https://generativelanguage.googleapis.com"),
+                          help="Gemini API base URL.")
+    g_models.add_argument("--gemini_thinking_budget", type=int,
+                          default=int(os.environ.get("GEMINI_THINKING_BUDGET", "0")),
+                          help="Gemini thinking budget (tokens). Use 0 to disable thinking for short-label stability.")
+    g_models.add_argument("--vlm_timeout_s", type=float,
+                          default=float(os.environ.get("VLM_TIMEOUT_S", "90")),
+                          help="Timeout (seconds) for external API VLM calls.")
+    # Optional pricing overrides used by usage-cost reporting.
+    g_models.add_argument("--openai_price_input_per_1m", type=float,
+                          default=float(os.environ.get("OPENAI_PRICE_INPUT_PER_1M", "2.5")),
+                          help="OpenAI input token price (USD per 1M tokens) for usage report.")
+    g_models.add_argument("--openai_price_cached_input_per_1m", type=float,
+                          default=float(os.environ.get("OPENAI_PRICE_CACHED_INPUT_PER_1M", "1.25")),
+                          help="OpenAI cached-input token price (USD per 1M tokens) for usage report.")
+    g_models.add_argument("--openai_price_output_per_1m", type=float,
+                          default=float(os.environ.get("OPENAI_PRICE_OUTPUT_PER_1M", "10.0")),
+                          help="OpenAI output token price (USD per 1M tokens) for usage report.")
+    g_models.add_argument("--gemini_price_input_per_1m", type=float,
+                          default=float(os.environ.get("GEMINI_PRICE_INPUT_PER_1M", "0.30")),
+                          help="Gemini input token price (USD per 1M tokens) for usage report.")
+    g_models.add_argument("--gemini_price_output_per_1m", type=float,
+                          default=float(os.environ.get("GEMINI_PRICE_OUTPUT_PER_1M", "2.50")),
+                          help="Gemini output token price (USD per 1M tokens) for usage report.")
     # Disable VLM entirely (debug only).
     g_models.add_argument("--skip_vlm", action="store_true",
-                          help="Skip loading Qwen and any VLM calls (debug only; low quality / empty samples).")
+                          help="Skip loading VLM and any VLM calls (debug only; low quality / empty samples).")
 
     # -------------------------------------------------------------------------
     # Targets / quotas
@@ -153,6 +245,75 @@ def parse_args():
     g_task.add_argument("--task1_reasoning_mode", type=str, default="gt",
                         choices=["gt", "vlm"],
                         help="Task1 reasoning style: gt (template) or vlm (spatial/cognitive).")
+    # Task1 semantic label arbiter (disagreement-only CoT-style verifier/refiner).
+    g_task.add_argument("--task1_semantic_arbiter", action="store_true", default=False,
+                        help="Enable Task1 semantic arbiter for disagreement/borderline label refinement.")
+    # Short alias for convenience in runs.
+    g_task.add_argument("--cot", action="store_true", default=False,
+                        help="Alias for --task1_semantic_arbiter.")
+    # Task1 hybrid guardrail: keep base labeling provider and run a secondary arbiter model on hard cases.
+    g_task.add_argument("--task1_hybrid_guardrail", action="store_true", default=False,
+                        help="Enable Task1 hybrid guardrail (scene-aware arbiter + optional constrained Qwen refine).")
+    g_task.add_argument("--task1_guardrail_provider", type=str, default="gemini",
+                        choices=["gemini", "openai", "qwen"],
+                        help="Provider used only for Task1 hybrid guardrail arbitration.")
+    g_task.add_argument("--task1_guardrail_model", type=str, default="",
+                        help="Optional model override for Task1 guardrail provider.")
+    g_task.add_argument("--task1_guardrail_min_conf", type=str, default="MEDIUM",
+                        choices=["LOW", "MEDIUM", "HIGH"],
+                        help="Minimum guardrail confidence before allowing label switch (unless current label is ambiguous).")
+    g_task.add_argument("--task1_guardrail_max_new_tokens", type=int, default=96,
+                        help="Token budget for Task1 guardrail arbitration responses.")
+    g_task.add_argument("--task1_guardrail_disable_scene_check", action="store_true", default=False,
+                        help="Disable scene-setting plausibility signal in Task1 hybrid guardrail decisions.")
+    g_task.add_argument("--task1_guardrail_disable_qwen_refine", action="store_true", default=False,
+                        help="Disable constrained Qwen follow-up after guardrail proposal.")
+    g_task.add_argument("--task1_guardrail_gemini_thinking_budget", type=int, default=48,
+                        help="Gemini thinking budget used by Task1 guardrail calls.")
+    g_task.add_argument("--task1_guardrail_gemini_top_p", type=float, default=0.85,
+                        help="Gemini topP used by Task1 guardrail calls.")
+    g_task.add_argument("--task1_guardrail_gemini_top_k", type=int, default=32,
+                        help="Gemini topK used by Task1 guardrail calls.")
+    # Task1 segmentation preprocessing beyond CLAHE (optional).
+    g_task.add_argument("--task1_seg_bilateral", action="store_true", default=False,
+                        help="Apply bilateral filtering on LAB-L channel before SAM2.")
+    g_task.add_argument("--task1_seg_bilateral_d", type=int, default=9,
+                        help="Bilateral filter neighborhood diameter.")
+    g_task.add_argument("--task1_seg_bilateral_sigma_color", type=float, default=75.0,
+                        help="Bilateral sigmaColor.")
+    g_task.add_argument("--task1_seg_bilateral_sigma_space", type=float, default=75.0,
+                        help="Bilateral sigmaSpace.")
+    g_task.add_argument("--task1_seg_lb_edge_boost", action="store_true", default=False,
+                        help="Boost LAB-L using combined Canny edges from L and b channels.")
+    g_task.add_argument("--task1_seg_edge_l_low", type=int, default=30,
+                        help="Canny low threshold for L channel.")
+    g_task.add_argument("--task1_seg_edge_l_high", type=int, default=100,
+                        help="Canny high threshold for L channel.")
+    g_task.add_argument("--task1_seg_edge_b_low", type=int, default=20,
+                        help="Canny low threshold for b channel.")
+    g_task.add_argument("--task1_seg_edge_b_high", type=int, default=50,
+                        help="Canny high threshold for b channel.")
+    g_task.add_argument("--task1_seg_edge_boost_alpha", type=float, default=0.2,
+                        help="Blend weight for edge boost onto LAB-L (0.0-1.0).")
+    g_task.add_argument("--task1_seg_edge_dilate_iter", type=int, default=1,
+                        help="Optional edge dilation iterations before boost.")
+    g_task.add_argument("--task1_large_mask_refine", action="store_true", default=False,
+                        help="If Task1 mask area is larger than person bbox area, run an extra tighter refinement cue.")
+    g_task.add_argument("--task1_large_mask_refine_trigger_ratio", type=float, default=1.0,
+                        help="Trigger extra refine when mask_area_px >= trigger_ratio * person_bbox_area_px.")
+    g_task.add_argument("--task1_large_mask_refine_max_frac", type=float, default=0.85,
+                        help="Accept extra refine only if refined mask area <= this fraction of original mask area.")
+    g_task.add_argument("--task1_large_mask_refine_point_scale", type=float, default=0.45,
+                        help="Point-box scale (vs TASK1_POINT_BOX_SIZE) for extra tighter refine.")
+    g_task.add_argument("--task1_large_mask_refine_pad_scale", type=float, default=0.2,
+                        help="Padding scale (vs TASK1_PAD_AROUND_MASK) for extra tighter refine.")
+    g_task.add_argument(
+        "--task1_seg_preset",
+        type=str,
+        default="clahe_only",
+        choices=["clahe_only", "clahe_bilateral", "clahe_bilateral_edge"],
+        help="Simple Task1 preprocessing preset (keeps CLAHE on by default).",
+    )
     # Task4: query the gaze target itself (legacy).
     g_task.add_argument("--task4_use_gaze_target", action="store_true", default=False,
                         help="If set, Task4 queries the gaze target (legacy). Default: use distractor object.")
@@ -192,6 +353,13 @@ if ARGS.no_scan_dataset_stats:
     ARGS.scan_dataset_stats = False
 if ARGS.allow_partial_tasks:
     ARGS.require_all_tasks = False
+if ARGS.cot:
+    ARGS.task1_semantic_arbiter = True
+if ARGS.task1_seg_preset == "clahe_bilateral":
+    ARGS.task1_seg_bilateral = True
+elif ARGS.task1_seg_preset == "clahe_bilateral_edge":
+    ARGS.task1_seg_bilateral = True
+    ARGS.task1_seg_lb_edge_boost = True
 
 
 # =============================================================================
@@ -202,7 +370,37 @@ def now_str():
     return time.strftime("%Y%m%d_%H%M%S", time.localtime())
 
 
-RUN_NAME = ARGS.run_name.strip() or f"run_{now_str()}_v3"
+def _resolve_vlm_model_id(args):
+    provider = str(getattr(args, "vlm_provider", "qwen")).strip().lower()
+    override = str(getattr(args, "vlm_model", "")).strip()
+    if provider == "qwen":
+        return str(getattr(args, "qwen_model", "Qwen/Qwen2.5-VL-7B-Instruct")).strip()
+    if override:
+        return override
+    if provider == "openai":
+        return os.environ.get("OPENAI_MODEL", "gpt-4o")
+    return os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+
+def _slugify_model_for_run_name(model_name, max_len=80):
+    s = str(model_name or "").strip()
+    if not s:
+        return "unknown-model"
+    # Keep it filesystem-safe and compact.
+    s = s.replace("/", "-").replace("\\", "-").replace(":", "-")
+    s = re.sub(r"[^A-Za-z0-9._-]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-_.")
+    if not s:
+        s = "unknown-model"
+    if len(s) > int(max_len):
+        s = s[: int(max_len)].rstrip("-_.")
+    return s or "unknown-model"
+
+
+_RESOLVED_VLM_MODEL_ID = _resolve_vlm_model_id(ARGS)
+_RUN_MODEL_SUFFIX = _slugify_model_for_run_name(_RESOLVED_VLM_MODEL_ID)
+
+RUN_NAME = ARGS.run_name.strip() or f"run_{now_str()}_v4_{_RUN_MODEL_SUFFIX}"
 OUT_ROOT = Path(ARGS.out_root).resolve()
 RUN_DIR = OUT_ROOT / "runs" / RUN_NAME
 RUN_DIR.mkdir(parents=True, exist_ok=True)
@@ -220,6 +418,7 @@ BENCH_JSON = RUN_DIR / "benchmark_gazevqa.json"
 DEBUG_MANIFEST = DEBUG_DIR / "debug_manifest.jsonl"
 RUN_LOG = LOG_DIR / "run.log"
 CONFIG_JSON = RUN_DIR / "run_config.json"
+VLM_USAGE_JSON = RUN_DIR / "vlm_usage_report.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -257,15 +456,33 @@ TARGET_TASK1, TARGET_TASK2, TARGET_TASK3, TARGET_TASK4 = ARGS.targets
 TARGET_BUNDLE = min(TARGET_TASK1, TARGET_TASK2, TARGET_TASK3, TARGET_TASK4)
 RESIZE_WH = tuple(ARGS.resize_wh)
 
-GAZE_LINE_W = 2
-GAZE_DOT_R = 3
+GAZE_LINE_W = 5
+GAZE_DOT_R = 7
 GAZE_COLOR = (255, 0, 0)
+# Ray marker tuning: place marker slightly before the gaze coordinate to reduce occlusion.
+GAZE_ARROW_OFFSET_PX = 8
+GAZE_ARROW_LEN = 12
+GAZE_ARROW_HALF_W = 5
 
 SAM2_REPO_DIR = str(Path(ARGS.sam2_repo).resolve())
 SAM2_CHECKPOINT = str(Path(ARGS.sam2_ckpt).resolve())
 SAM2_CFG_BASENAME = "sam2_hiera_l.yaml"
 
+VLM_PROVIDER = str(ARGS.vlm_provider).strip().lower()
+VLM_MODEL_OVERRIDE = str(ARGS.vlm_model).strip()
 QWEN_MODEL_ID = ARGS.qwen_model
+OPENAI_BASE_URL = str(ARGS.openai_base_url).strip()
+GEMINI_API_BASE = str(ARGS.gemini_api_base).strip()
+GEMINI_THINKING_BUDGET = int(ARGS.gemini_thinking_budget)
+VLM_TIMEOUT_S = float(ARGS.vlm_timeout_s)
+OPENAI_PRICE_INPUT_PER_1M = float(ARGS.openai_price_input_per_1m)
+OPENAI_PRICE_CACHED_INPUT_PER_1M = float(ARGS.openai_price_cached_input_per_1m)
+OPENAI_PRICE_OUTPUT_PER_1M = float(ARGS.openai_price_output_per_1m)
+GEMINI_PRICE_INPUT_PER_1M = float(ARGS.gemini_price_input_per_1m)
+GEMINI_PRICE_OUTPUT_PER_1M = float(ARGS.gemini_price_output_per_1m)
+
+VLM_MODEL_ID = _RESOLVED_VLM_MODEL_ID
+
 MIN_PIXELS = 256 * 28 * 28
 MAX_PIXELS = 768 * 28 * 28
 
@@ -279,23 +496,57 @@ TASK1_CONF_THRESHOLD = float(ARGS.task1_conf_threshold)
 
 # Task1 segmentation behavior
 TASK1_USE_TIGHT_BOX = True # True
-TASK1_POINT_BOX_SIZE = 50
-TASK1_PAD_AROUND_MASK = 20
+TASK1_POINT_BOX_SIZE = 220
+TASK1_PAD_AROUND_MASK = 30
 TASK1_PAD_AROUND_MASK_RATIO = 0.12
 TASK1_PAD_AROUND_MASK_MAX = 50
 TASK1_DILATE_MASK = True # False
-TASK1_DILATE_ITER = 2 # 1
+TASK1_DILATE_ITER = 5 # 1
 TASK1_MASK_MIN_AREA_RATIO = 0.000001
-TASK1_MASK_MAX_AREA_RATIO = 0.5
-TASK1_SMALL_OBJ_AREA_RATIO = 0.05
+TASK1_MASK_MAX_AREA_RATIO = 0.65
+TASK1_SMALL_OBJ_AREA_RATIO = 0.01
+TASK1_SMALL_MASK_USE_CONTEXT = True
+TASK1_SMALL_MASK_CONTEXT_AREA_RATIO = 0.03
+TASK1_SMALL_MASK_CONTEXT_EXPAND_RATIO = 3.14
 TASK1_GAZE_CONF_RADIUS = 8
-TASK1_MIN_SOFT_CONF_AROUND_GAZE = 0.027818
-TASK1_SOFT_MASK_THRESHOLD = 0.027818
+TASK1_MIN_SOFT_CONF_AROUND_GAZE = 0.01
+TASK1_SOFT_MASK_THRESHOLD = 0.01
 TASK1_MASK_OVERLAY_ALPHA = 0.55
+TASK1_SEG_USE_CLAHE = True
+TASK1_SEG_CLAHE_CLIP = 2.0
+TASK1_SEG_CLAHE_TILE = 8
+TASK1_SEG_USE_BILATERAL = bool(ARGS.task1_seg_bilateral)
+TASK1_SEG_BILATERAL_D = int(ARGS.task1_seg_bilateral_d)
+TASK1_SEG_BILATERAL_SIGMA_COLOR = float(ARGS.task1_seg_bilateral_sigma_color)
+TASK1_SEG_BILATERAL_SIGMA_SPACE = float(ARGS.task1_seg_bilateral_sigma_space)
+TASK1_SEG_USE_LB_EDGE_BOOST = bool(ARGS.task1_seg_lb_edge_boost)
+TASK1_SEG_EDGE_L_LOW = int(ARGS.task1_seg_edge_l_low)
+TASK1_SEG_EDGE_L_HIGH = int(ARGS.task1_seg_edge_l_high)
+TASK1_SEG_EDGE_B_LOW = int(ARGS.task1_seg_edge_b_low)
+TASK1_SEG_EDGE_B_HIGH = int(ARGS.task1_seg_edge_b_high)
+TASK1_SEG_EDGE_BOOST_ALPHA = float(ARGS.task1_seg_edge_boost_alpha)
+TASK1_SEG_EDGE_DILATE_ITER = int(ARGS.task1_seg_edge_dilate_iter)
+TASK1_LARGE_MASK_REFINE = bool(ARGS.task1_large_mask_refine)
+TASK1_LARGE_MASK_REFINE_TRIGGER_RATIO = float(ARGS.task1_large_mask_refine_trigger_ratio)
+TASK1_LARGE_MASK_REFINE_MAX_FRAC = float(ARGS.task1_large_mask_refine_max_frac)
+TASK1_LARGE_MASK_REFINE_POINT_SCALE = float(ARGS.task1_large_mask_refine_point_scale)
+TASK1_LARGE_MASK_REFINE_PAD_SCALE = float(ARGS.task1_large_mask_refine_pad_scale)
+# Dynamic attempt gating:
+# In loose-sweep->strict order, do not early-accept loose stages below this
+# area ratio unless retries are exhausted.
+TASK1_EARLY_ACCEPT_MIN_AREA_RATIO = 0.0314 #.01
+# Require at least one cue agreement (dot/ray text vs mask label) before
+# accepting a non-final attempt early.
+TASK1_EARLY_ACCEPT_REQUIRE_CUE_AGREEMENT = True
 
 # Mask-person overlap rejection: RETRY then fallback
 TASK1_REJECT_IF_MASK_OVERLAPS_PERSON = True
 TASK1_PERSON_OVERLAP_THRESHOLD = 0.5
+# Anchor camera distance preference (normalized by person bbox diag).
+# Mid-distance tends to avoid person overlap while staying close enough for accuracy.
+TASK1_ANCHOR_DIST_TARGET = 0.7
+TASK1_ANCHOR_DIST_SIGMA = 0.3
+TASK1_ANCHOR_MEDIUM_BAND = 0.18
 
 TASK2_AZIMUTH_PLANE = "xz"
 TASK2_AXIS_DIAG = True
@@ -311,12 +562,19 @@ TASK3_NUM_VIEWS_MAX = 6
 TASK4_REQUIRE_VERIFIER_PASS = True
 TASK4_OBJECT_PROPOSAL_MAX_TRIES = 4
 TASK4_VERIFIER_MAX_TRIES = 5
-TASK4_DISTRACTOR_MIN_AREA_RATIO = 0.005
-TASK4_DISTRACTOR_MIN_BBOX_PX = 1
+TASK4_DISTRACTOR_MIN_AREA_RATIO = 0.0015
+TASK4_DISTRACTOR_MIN_BBOX_PX = 25
 TASK4_DISTRACTOR_VERIFY_LABEL = True
 TASK4_DISTRACTOR_MAX_AREA_RATIO = 0.3
+# Prefer distractor masks near this area ratio rather than always picking the largest mask.
+TASK4_DISTRACTOR_TARGET_AREA_RATIO = 0.02
+# Smoothness of area preference in log-area space (higher = flatter preference).
+TASK4_DISTRACTOR_LOG_AREA_SIGMA = 0.9
+# Small tiebreaker toward larger masks up to target-area scale.
+TASK4_DISTRACTOR_SCORE_AREA_WEIGHT = 0.15
 TASK4_DISTRACTOR_MIN_DIST_RATIO = 0.02818 * 3.14
 TASK4_DISTRACTOR_MAX_DIST_RATIO = 0.95
+TASK4_DISTRACTOR_EDGE_PAD_PX = 20
 TASK4_BAD_DISTRACTOR_WORDS = {
     "grid", "pattern", "texture", "tiles", "tile", "carpet", "rug", "mat",
     "floor", "ceiling", "wall", "ground", "surface"
@@ -332,6 +590,18 @@ REASONING_MODE = ARGS.reasoning_mode
 DUMP_OVERLAP_DEBUG = bool(ARGS.dump_overlap_debug)
 TASK4_USE_GAZE_TARGET = bool(ARGS.task4_use_gaze_target)
 TASK1_REASONING_MODE = ARGS.task1_reasoning_mode
+TASK1_SEMANTIC_ARBITER = bool(ARGS.task1_semantic_arbiter)
+TASK1_SEMANTIC_ARBITER_MIN_CONF = "MEDIUM"
+TASK1_HYBRID_GUARDRAIL = bool(ARGS.task1_hybrid_guardrail)
+TASK1_GUARDRAIL_PROVIDER = str(ARGS.task1_guardrail_provider).strip().lower()
+TASK1_GUARDRAIL_MODEL = str(ARGS.task1_guardrail_model).strip()
+TASK1_GUARDRAIL_MIN_CONF = str(ARGS.task1_guardrail_min_conf).strip().upper()
+TASK1_GUARDRAIL_MAX_NEW_TOKENS = int(ARGS.task1_guardrail_max_new_tokens)
+TASK1_GUARDRAIL_SCENE_CHECK = not bool(ARGS.task1_guardrail_disable_scene_check)
+TASK1_GUARDRAIL_QWEN_REFINE = not bool(ARGS.task1_guardrail_disable_qwen_refine)
+TASK1_GUARDRAIL_GEMINI_THINKING_BUDGET = int(ARGS.task1_guardrail_gemini_thinking_budget)
+TASK1_GUARDRAIL_GEMINI_TOP_P = float(ARGS.task1_guardrail_gemini_top_p)
+TASK1_GUARDRAIL_GEMINI_TOP_K = int(ARGS.task1_guardrail_gemini_top_k)
 BUNDLE_TARGET = TARGET_BUNDLE
 
 CANON_CAMS = [f"Cam{i}" for i in range(1, 7)]
@@ -403,3 +673,6 @@ TASK2_DIST_STATS = {
     "med_dist_vals": [],
     "med_dist_reject_vals": [],
 }
+
+# Runtime context for per-frame VLM usage accounting.
+CURRENT_FRAME_KEY = None

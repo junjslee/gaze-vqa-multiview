@@ -1,6 +1,7 @@
 # task4.py
 from collections import Counter
 import random
+import math
 import numpy as np
 from PIL import ImageDraw
 from pathlib import Path
@@ -8,7 +9,13 @@ from pathlib import Path
 from . import state as st
 from .annotations import parse_visibility, get_body_bbox, get_head_bbox, scale_annotations_for_resized_image
 from .io_utils import save_raw_cam_images_parallel, zip_try_image_path, zip_read_image
-from .sam2_utils import ensure_sam2, segment_object_at_gaze_precomputed, _crop_soft_masked, _crop_overlay_from_mask
+from .sam2_utils import (
+    ensure_sam2,
+    preprocess_segmentation_image_np,
+    segment_object_at_gaze_precomputed,
+    _crop_soft_masked,
+    _crop_overlay_from_mask,
+)
 from .task1 import (
     describe_masked_object,
     describe_masked_object_detailed,
@@ -285,6 +292,29 @@ def _task4_segmentation_attempts():
     return [("strict", strict), ("relaxed", relaxed), ("loose", loose)]
 
 
+def _task4_distractor_score(mask_area_ratio):
+    """
+    Score distractor candidates by preferring masks near a target area ratio,
+    with a mild tiebreak toward larger masks (up to target scale).
+    """
+    area = float(mask_area_ratio)
+    eps = 1e-12
+    min_area = max(eps, float(st.TASK4_DISTRACTOR_MIN_AREA_RATIO))
+    max_area = max(min_area + eps, float(st.TASK4_DISTRACTOR_MAX_AREA_RATIO))
+    target = float(st.TASK4_DISTRACTOR_TARGET_AREA_RATIO)
+    target = min(max(target, min_area), max_area)
+
+    sigma = max(0.2, float(st.TASK4_DISTRACTOR_LOG_AREA_SIGMA))
+    area_log = math.log(max(area, eps))
+    target_log = math.log(max(target, eps))
+    d = abs(area_log - target_log)
+    proximity = math.exp(-(d * d) / (2.0 * sigma * sigma))
+
+    area_weight = min(0.5, max(0.0, float(st.TASK4_DISTRACTOR_SCORE_AREA_WEIGHT)))
+    larger_bonus = min(1.0, area / max(target, eps))
+    return proximity + (area_weight * larger_bonus)
+
+
 def _sample_distractor_object_phrase_sam2(
     zf, split, seq, frame_id,
     anchor_cam,
@@ -308,6 +338,7 @@ def _sample_distractor_object_phrase_sam2(
     gx, gy = float(gaze_xy_resized[0]), float(gaze_xy_resized[1])
     min_d = st.TASK4_DISTRACTOR_MIN_DIST_RATIO * max(W, H)
     max_d = st.TASK4_DISTRACTOR_MAX_DIST_RATIO * max(W, H)
+    edge_pad = max(0.0, float(getattr(st, "TASK4_DISTRACTOR_EDGE_PAD_PX", 20.0)))
 
     def _in_band(pt):
         dx = float(pt[0]) - gx
@@ -315,9 +346,23 @@ def _sample_distractor_object_phrase_sam2(
         d = (dx * dx + dy * dy) ** 0.5
         return min_d <= d <= max_d
 
+    def _inside_safe_bounds(pt):
+        x, y = float(pt[0]), float(pt[1])
+        return (edge_pad <= x <= (W - 1 - edge_pad)) and (edge_pad <= y <= (H - 1 - edge_pad))
+
     anno_orig = per_cam.get(anchor_cam, {})
     anno_scaled, _ = scale_annotations_for_resized_image(anno_orig, anchor_orig.size, anchor_resized.size)
     body_bbox_scaled = get_body_bbox(anno_scaled) if anno_scaled else None
+
+    def _outside_person_bbox(pt):
+        if body_bbox_scaled is None:
+            return True
+        try:
+            x, y, w, h = [float(v) for v in body_bbox_scaled]
+            px, py = float(pt[0]), float(pt[1])
+        except Exception:
+            return True
+        return not (x <= px <= (x + max(0.0, w)) and y <= py <= (y + max(0.0, h)))
 
     candidates = [
         (W - gx, H - gy),
@@ -331,12 +376,12 @@ def _sample_distractor_object_phrase_sam2(
         (W * 0.90, H * 0.50),
     ]
 
-    candidates = [pt for pt in candidates if _in_band(pt)]
+    candidates = [pt for pt in candidates if _in_band(pt) and _inside_safe_bounds(pt) and _outside_person_bbox(pt)]
 
     for _ in range(40):
-        rx = random.uniform(0.05 * W, 0.95 * W)
-        ry = random.uniform(0.05 * H, 0.95 * H)
-        if _in_band((rx, ry)):
+        rx = random.uniform(edge_pad, max(edge_pad, W - 1 - edge_pad))
+        ry = random.uniform(edge_pad, max(edge_pad, H - 1 - edge_pad))
+        if _in_band((rx, ry)) and _inside_safe_bounds((rx, ry)) and _outside_person_bbox((rx, ry)):
             candidates.append((rx, ry))
 
     best_label = None
@@ -354,10 +399,16 @@ def _sample_distractor_object_phrase_sam2(
     # Reuse embeddings for many point queries on the same anchor image.
     predictor = ensure_sam2()
     anchor_np = np.array(anchor_resized)
-    predictor.set_image(anchor_np)
+    predictor.set_image(preprocess_segmentation_image_np(anchor_np))
     seg_attempts = _task4_segmentation_attempts()
 
     for (px, py) in candidates[:18]:
+        if not _inside_safe_bounds((px, py)):
+            counts["cand_near_edge"] += 1
+            continue
+        if not _outside_person_bbox((px, py)):
+            counts["cand_inside_person_bbox"] += 1
+            continue
         counts["cand_total"] += 1
         seg_best = None
         seg_best_score = -1.0
@@ -457,7 +508,7 @@ def _sample_distractor_object_phrase_sam2(
                 continue
 
         counts["candidate_pass"] += 1
-        score = mask_area_ratio
+        score = _task4_distractor_score(mask_area_ratio)
         if score > best_score:
             best_label = lab
             best_score = score
@@ -612,7 +663,7 @@ def build_task4_accessibility_grounded_to_task1(
                     mv_labels[cam] = mv_phrase
 
             if mv_labels:
-                mv_canon, mv_canon_mode = _synthesize_multiview_labels(
+                mv_canon, mv_canon_mode, _ = _synthesize_multiview_labels(
                     list(mv_labels.values()), scene_type=split
                 )
                 if mv_canon:
