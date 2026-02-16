@@ -23,7 +23,13 @@ from .task2 import build_task2_relative_camera_rotation, load_triangulate_map
 from .task3 import build_task3_binary_per_view
 from .task4 import build_task4_accessibility_grounded_to_task1
 from .annotations import scale_annotations_for_resized_image, get_body_bbox, has_coord
-from .utils import audit_every_n_accepts, write_snapshot_if_needed, write_frame_debug
+from .utils import (
+    audit_every_n_accepts,
+    write_snapshot_if_needed,
+    write_frame_debug,
+    summarize_teacher_verifier,
+    write_gemini_teacher_verifier_report,
+)
 from .io_utils import save_raw_cam_images_parallel, zip_read_image
 from .utils import _resize
 
@@ -497,6 +503,12 @@ def generate_benchmark_single():
         vlm_usage_path = write_vlm_usage_report(st.VLM_USAGE_JSON)
         if vlm_usage_path:
             st.logger.info(f"Saved VLM usage report: {vlm_usage_path}")
+    teacher_verifier_summary = summarize_teacher_verifier(samples)
+    teacher_verifier_path = write_gemini_teacher_verifier_report(
+        samples, path=st.GEMINI_TEACHER_VERIFIER_REPORT_JSON
+    )
+    if teacher_verifier_path:
+        st.logger.info(f"Saved Gemini teacher/verifier report: {teacher_verifier_path}")
 
     bundle_skip_stats = None
     if st.REQUIRE_ALL_TASKS_PER_FRAME:
@@ -537,6 +549,8 @@ def generate_benchmark_single():
             "vlm_usage_report": vlm_usage_path,
             "vlm_usage_totals": (vlm_usage_report or {}).get("totals") if vlm_usage_report else None,
             "bundle_skip_stats": bundle_skip_stats,
+            "gemini_teacher_verifier_report": teacher_verifier_path,
+            "gemini_teacher_verifier_summary": teacher_verifier_summary,
         },
         "counts": counts,
         "reject_stats": st.REJECT_STATS,
@@ -563,6 +577,24 @@ def generate_benchmark_single():
         )
 
     st.logger.info("=== FINAL REJECTION BREAKDOWN ===")
+    t1_tv = (teacher_verifier_summary or {}).get("task1_teacher", {})
+    t4_tv = (teacher_verifier_summary or {}).get("task4_verifier", {})
+    if int(t1_tv.get("samples") or 0) > 0:
+        st.logger.info(
+            "TASK1 teacher parse/apply summary: "
+            f"parse={t1_tv.get('parse_success')}/{t1_tv.get('parse_attempts')} "
+            f"({(t1_tv.get('parse_success_rate') or 0.0):.4f}) "
+            f"applied={t1_tv.get('applied')}/{t1_tv.get('samples')} "
+            f"({(t1_tv.get('applied_rate') or 0.0):.4f}) "
+            f"partial_retry_calls={t1_tv.get('partial_retry_calls')}"
+        )
+    if int(t4_tv.get("samples") or 0) > 0:
+        st.logger.info(
+            "TASK4 verifier parse/action summary: "
+            f"parse={t4_tv.get('parse_success')}/{t4_tv.get('samples')} "
+            f"({(t4_tv.get('parse_success_rate') or 0.0):.4f}) "
+            f"actions={json.dumps(t4_tv.get('actions', {}), sort_keys=True)}"
+        )
     if st.TASK2_DIST_STATS["med_dist_vals"]:
         arr = np.array(st.TASK2_DIST_STATS["med_dist_vals"], dtype=np.float64)
         st.logger.info("=== TASK2 median_dist summary ===")

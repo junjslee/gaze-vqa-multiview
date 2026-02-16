@@ -274,6 +274,53 @@ def parse_args():
                         help="Gemini topP used by Task1 guardrail calls.")
     g_task.add_argument("--task1_guardrail_gemini_top_k", type=int, default=32,
                         help="Gemini topK used by Task1 guardrail calls.")
+    # Task1 teacher-final pipeline (Qwen student -> Gemini teacher).
+    g_task.add_argument("--task1_teacher_final", action="store_true", default=True,
+                        help="Enable Task1 teacher-final pipeline (Gemini adjudicates final Task1 label).")
+    g_task.add_argument("--task1_disable_teacher_final", action="store_true", default=False,
+                        help="Disable Task1 teacher-final pipeline.")
+    g_task.add_argument("--task1_teacher_provider", type=str, default="gemini",
+                        choices=["gemini", "openai", "qwen"],
+                        help="Provider used by Task1 teacher-final adjudication.")
+    g_task.add_argument("--task1_teacher_model", type=str, default="gemini-3-flash-preview",
+                        help="Model id for Task1 teacher-final adjudication.")
+    g_task.add_argument("--task1_teacher_force_call", action="store_true", default=True,
+                        help="Always run Task1 teacher pass-1 once per sample.")
+    g_task.add_argument("--task1_disable_teacher_force_call", action="store_true", default=False,
+                        help="Disable mandatory Task1 teacher pass-1.")
+    g_task.add_argument("--task1_teacher_max_calls", type=int, default=2,
+                        help="Maximum number of Task1 teacher calls per sample.")
+    g_task.add_argument("--task1_teacher_second_call_on_mismatch", action="store_true", default=True,
+                        help="Run Task1 teacher pass-2 only when Qwen and teacher labels semantically mismatch.")
+    g_task.add_argument("--task1_disable_teacher_second_call", action="store_true", default=False,
+                        help="Disable Task1 teacher pass-2 on semantic mismatch.")
+    g_task.add_argument("--task1_teacher_min_conf", type=str, default="MEDIUM",
+                        choices=["LOW", "MEDIUM", "HIGH"],
+                        help="Minimum confidence for applying teacher-selected Task1 labels.")
+    g_task.add_argument("--task1_teacher_temperature", type=float, default=0.2,
+                        help="Temperature used in Task1 teacher calls.")
+    g_task.add_argument("--task1_teacher_max_new_tokens", type=int, default=512,
+                        help="Token budget for Task1 teacher responses.")
+    g_task.add_argument("--task1_teacher_gemini_thinking_level", type=str, default="medium",
+                        choices=["minimal", "low", "medium", "high"],
+                        help="Gemini thinking level for Task1 teacher calls.")
+    g_task.add_argument("--task1_teacher_gemini_thinking_budget", type=int, default=64,
+                        help="Gemini thinking budget for Task1 teacher calls.")
+    g_task.add_argument("--task1_teacher_gemini_media_resolution", type=str, default="high",
+                        choices=["low", "medium", "high", "ultra_high"],
+                        help="Gemini media resolution for Task1 teacher calls (ultra_high is per-part Gemini 3 only).")
+    g_task.add_argument("--task1_teacher_structured_json", action="store_true", default=True,
+                        help="Request structured JSON output for Task1 teacher Gemini calls.")
+    g_task.add_argument("--task1_disable_teacher_structured_json", action="store_true", default=False,
+                        help="Disable structured JSON mode for Task1 teacher calls.")
+    g_task.add_argument("--task1_teacher_retry_on_partial_json", action="store_true", default=True,
+                        help="Retry Task1 teacher Gemini calls with larger token budget when JSON is partial/invalid.")
+    g_task.add_argument("--task1_disable_teacher_retry_on_partial_json", action="store_true", default=False,
+                        help="Disable partial-JSON retry behavior for Task1 teacher calls.")
+    g_task.add_argument("--task1_teacher_retry_token_multiplier", type=float, default=2.0,
+                        help="Multiplier for retry maxOutputTokens on partial Task1 teacher JSON responses.")
+    g_task.add_argument("--task1_legacy_pipeline", action="store_true", default=False,
+                        help="Use legacy Task1 late-stage arbitration path instead of teacher-final.")
     # Task1 segmentation preprocessing beyond CLAHE (optional).
     g_task.add_argument("--task1_seg_bilateral", action="store_true", default=False,
                         help="Apply bilateral filtering on LAB-L channel before SAM2.")
@@ -320,6 +367,42 @@ def parse_args():
     # Task4: proxy-ray + multiview label synthesis.
     g_task.add_argument("--task4_proxy_multiview", action="store_true", default=False,
                         help="Enable Task4 proxy-ray + multiview label synthesis for queried object.")
+    # Task4 Gemini visibility verifier.
+    g_task.add_argument("--task4_gemini_verifier", action="store_true", default=True,
+                        help="Enable Gemini visibility verifier for Task4 queried objects.")
+    g_task.add_argument("--task4_disable_gemini_verifier", action="store_true", default=False,
+                        help="Disable Task4 Gemini visibility verifier.")
+    g_task.add_argument("--task4_gemini_verifier_model", type=str, default="gemini-3-flash-preview",
+                        help="Model id used by Task4 Gemini verifier.")
+    g_task.add_argument("--task4_gemini_verifier_min_flip_conf", type=str, default="HIGH",
+                        choices=["LOW", "MEDIUM", "HIGH"],
+                        help="Minimum Gemini confidence to flip Task4 answer on disagreement.")
+    g_task.add_argument("--task4_gemini_verifier_reject_on_uncertain_conflict", action="store_true", default=True,
+                        help="Reject Task4 sample on Gemini disagreement below flip confidence.")
+    g_task.add_argument("--task4_disable_gemini_reject_on_uncertain_conflict", action="store_true", default=False,
+                        help="Keep Task4 sample when verifier disagreement confidence is below flip threshold.")
+    g_task.add_argument("--task4_gemini_verifier_max_new_tokens", type=int, default=192,
+                        help="Token budget for Task4 Gemini verifier responses.")
+    g_task.add_argument("--task4_gemini_verifier_temperature", type=float, default=0.2,
+                        help="Temperature used by Task4 Gemini verifier.")
+    g_task.add_argument("--task4_gemini_verifier_thinking_level", type=str, default="low",
+                        choices=["minimal", "low", "medium", "high"],
+                        help="Gemini thinking level for Task4 verifier calls.")
+    g_task.add_argument("--task4_gemini_verifier_thinking_budget", type=int, default=32,
+                        help="Gemini thinking budget for Task4 verifier calls.")
+    g_task.add_argument("--task4_gemini_verifier_media_resolution", type=str, default="high",
+                        choices=["low", "medium", "high", "ultra_high"],
+                        help="Gemini media resolution for Task4 verifier calls (ultra_high is per-part Gemini 3 only).")
+    g_task.add_argument("--task4_gemini_verifier_structured_json", action="store_true", default=True,
+                        help="Request structured JSON output for Task4 Gemini verifier calls.")
+    g_task.add_argument("--task4_disable_gemini_verifier_structured_json", action="store_true", default=False,
+                        help="Disable structured JSON mode for Task4 Gemini verifier.")
+    g_task.add_argument("--task4_gemini_verifier_retry_on_partial_json", action="store_true", default=True,
+                        help="Retry Task4 verifier Gemini calls with larger token budget when JSON is partial/invalid.")
+    g_task.add_argument("--task4_disable_gemini_verifier_retry_on_partial_json", action="store_true", default=False,
+                        help="Disable partial-JSON retry behavior for Task4 verifier calls.")
+    g_task.add_argument("--task4_gemini_verifier_retry_token_multiplier", type=float, default=2.0,
+                        help="Multiplier for retry maxOutputTokens on partial Task4 verifier JSON responses.")
     # Optional intrinsics load for traceability.
     g_task.add_argument("--load_intri", action="store_true", default=False,
                         help="DFS-search and load intri.yml for traceability (not required for current tasks).")
@@ -355,6 +438,24 @@ if ARGS.allow_partial_tasks:
     ARGS.require_all_tasks = False
 if ARGS.cot:
     ARGS.task1_semantic_arbiter = True
+if ARGS.task1_disable_teacher_final:
+    ARGS.task1_teacher_final = False
+if ARGS.task1_disable_teacher_force_call:
+    ARGS.task1_teacher_force_call = False
+if ARGS.task1_disable_teacher_second_call:
+    ARGS.task1_teacher_second_call_on_mismatch = False
+if ARGS.task1_disable_teacher_structured_json:
+    ARGS.task1_teacher_structured_json = False
+if ARGS.task1_disable_teacher_retry_on_partial_json:
+    ARGS.task1_teacher_retry_on_partial_json = False
+if ARGS.task4_disable_gemini_verifier:
+    ARGS.task4_gemini_verifier = False
+if ARGS.task4_disable_gemini_reject_on_uncertain_conflict:
+    ARGS.task4_gemini_verifier_reject_on_uncertain_conflict = False
+if ARGS.task4_disable_gemini_verifier_structured_json:
+    ARGS.task4_gemini_verifier_structured_json = False
+if ARGS.task4_disable_gemini_verifier_retry_on_partial_json:
+    ARGS.task4_gemini_verifier_retry_on_partial_json = False
 if ARGS.task1_seg_preset == "clahe_bilateral":
     ARGS.task1_seg_bilateral = True
 elif ARGS.task1_seg_preset == "clahe_bilateral_edge":
@@ -419,6 +520,7 @@ DEBUG_MANIFEST = DEBUG_DIR / "debug_manifest.jsonl"
 RUN_LOG = LOG_DIR / "run.log"
 CONFIG_JSON = RUN_DIR / "run_config.json"
 VLM_USAGE_JSON = RUN_DIR / "vlm_usage_report.json"
+GEMINI_TEACHER_VERIFIER_REPORT_JSON = RUN_DIR / "gemini_teacher_verifier_report.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -506,12 +608,12 @@ TASK1_MASK_MIN_AREA_RATIO = 0.000001
 TASK1_MASK_MAX_AREA_RATIO = 0.65
 TASK1_SMALL_OBJ_AREA_RATIO = 0.01
 TASK1_SMALL_MASK_USE_CONTEXT = True
-TASK1_SMALL_MASK_CONTEXT_AREA_RATIO = 0.03
-TASK1_SMALL_MASK_CONTEXT_EXPAND_RATIO = 3.14
-TASK1_GAZE_CONF_RADIUS = 8
+TASK1_SMALL_MASK_CONTEXT_AREA_RATIO = 0.05
+TASK1_SMALL_MASK_CONTEXT_EXPAND_RATIO = 5
+TASK1_GAZE_CONF_RADIUS = 4
 TASK1_MIN_SOFT_CONF_AROUND_GAZE = 0.01
 TASK1_SOFT_MASK_THRESHOLD = 0.01
-TASK1_MASK_OVERLAY_ALPHA = 0.55
+TASK1_MASK_OVERLAY_ALPHA = 0.65
 TASK1_SEG_USE_CLAHE = True
 TASK1_SEG_CLAHE_CLIP = 2.0
 TASK1_SEG_CLAHE_TILE = 8
@@ -544,9 +646,13 @@ TASK1_REJECT_IF_MASK_OVERLAPS_PERSON = True
 TASK1_PERSON_OVERLAP_THRESHOLD = 0.5
 # Anchor camera distance preference (normalized by person bbox diag).
 # Mid-distance tends to avoid person overlap while staying close enough for accuracy.
-TASK1_ANCHOR_DIST_TARGET = 0.7
-TASK1_ANCHOR_DIST_SIGMA = 0.3
+TASK1_ANCHOR_DIST_TARGET = 0.6
+TASK1_ANCHOR_DIST_SIGMA = 0.2
 TASK1_ANCHOR_MEDIUM_BAND = 0.18
+# Multiview voting tweak:
+# If one view is extremely close (gaze point hugging person bbox), soften only that view.
+TASK1_MV_CLOSEST_DIST_NORM_THRESH = 0.20
+TASK1_MV_CLOSEST_WEIGHT_DOWNSCALE = 0.8
 
 TASK2_AZIMUTH_PLANE = "xz"
 TASK2_AXIS_DIAG = True
@@ -560,8 +666,8 @@ TASK3_NUM_VIEWS_MIN = 2
 TASK3_NUM_VIEWS_MAX = 6
 
 TASK4_REQUIRE_VERIFIER_PASS = True
-TASK4_OBJECT_PROPOSAL_MAX_TRIES = 4
-TASK4_VERIFIER_MAX_TRIES = 5
+TASK4_OBJECT_PROPOSAL_MAX_TRIES = 5
+TASK4_VERIFIER_MAX_TRIES = 4
 TASK4_DISTRACTOR_MIN_AREA_RATIO = 0.0015
 TASK4_DISTRACTOR_MIN_BBOX_PX = 25
 TASK4_DISTRACTOR_VERIFY_LABEL = True
@@ -602,6 +708,34 @@ TASK1_GUARDRAIL_QWEN_REFINE = not bool(ARGS.task1_guardrail_disable_qwen_refine)
 TASK1_GUARDRAIL_GEMINI_THINKING_BUDGET = int(ARGS.task1_guardrail_gemini_thinking_budget)
 TASK1_GUARDRAIL_GEMINI_TOP_P = float(ARGS.task1_guardrail_gemini_top_p)
 TASK1_GUARDRAIL_GEMINI_TOP_K = int(ARGS.task1_guardrail_gemini_top_k)
+TASK1_TEACHER_FINAL = bool(ARGS.task1_teacher_final)
+TASK1_TEACHER_PROVIDER = str(ARGS.task1_teacher_provider).strip().lower()
+TASK1_TEACHER_MODEL = str(ARGS.task1_teacher_model).strip()
+TASK1_TEACHER_FORCE_CALL = bool(ARGS.task1_teacher_force_call)
+TASK1_TEACHER_MAX_CALLS = max(1, int(ARGS.task1_teacher_max_calls))
+TASK1_TEACHER_SECOND_CALL_ON_MISMATCH = bool(ARGS.task1_teacher_second_call_on_mismatch)
+TASK1_TEACHER_MIN_CONF = str(ARGS.task1_teacher_min_conf).strip().upper()
+TASK1_TEACHER_TEMPERATURE = float(ARGS.task1_teacher_temperature)
+TASK1_TEACHER_MAX_NEW_TOKENS = int(ARGS.task1_teacher_max_new_tokens)
+TASK1_TEACHER_GEMINI_THINKING_LEVEL = str(ARGS.task1_teacher_gemini_thinking_level).strip().lower()
+TASK1_TEACHER_GEMINI_THINKING_BUDGET = int(ARGS.task1_teacher_gemini_thinking_budget)
+TASK1_TEACHER_GEMINI_MEDIA_RESOLUTION = str(ARGS.task1_teacher_gemini_media_resolution).strip().lower()
+TASK1_TEACHER_STRUCTURED_JSON = bool(ARGS.task1_teacher_structured_json)
+TASK1_TEACHER_RETRY_ON_PARTIAL_JSON = bool(ARGS.task1_teacher_retry_on_partial_json)
+TASK1_TEACHER_RETRY_TOKEN_MULTIPLIER = float(ARGS.task1_teacher_retry_token_multiplier)
+TASK1_LEGACY_PIPELINE = bool(ARGS.task1_legacy_pipeline)
+TASK4_GEMINI_VERIFIER = bool(ARGS.task4_gemini_verifier)
+TASK4_GEMINI_VERIFIER_MODEL = str(ARGS.task4_gemini_verifier_model).strip()
+TASK4_GEMINI_VERIFIER_MIN_FLIP_CONF = str(ARGS.task4_gemini_verifier_min_flip_conf).strip().upper()
+TASK4_GEMINI_VERIFIER_REJECT_ON_UNCERTAIN_CONFLICT = bool(ARGS.task4_gemini_verifier_reject_on_uncertain_conflict)
+TASK4_GEMINI_VERIFIER_MAX_NEW_TOKENS = int(ARGS.task4_gemini_verifier_max_new_tokens)
+TASK4_GEMINI_VERIFIER_TEMPERATURE = float(ARGS.task4_gemini_verifier_temperature)
+TASK4_GEMINI_VERIFIER_THINKING_LEVEL = str(ARGS.task4_gemini_verifier_thinking_level).strip().lower()
+TASK4_GEMINI_VERIFIER_THINKING_BUDGET = int(ARGS.task4_gemini_verifier_thinking_budget)
+TASK4_GEMINI_VERIFIER_MEDIA_RESOLUTION = str(ARGS.task4_gemini_verifier_media_resolution).strip().lower()
+TASK4_GEMINI_VERIFIER_STRUCTURED_JSON = bool(ARGS.task4_gemini_verifier_structured_json)
+TASK4_GEMINI_VERIFIER_RETRY_ON_PARTIAL_JSON = bool(ARGS.task4_gemini_verifier_retry_on_partial_json)
+TASK4_GEMINI_VERIFIER_RETRY_TOKEN_MULTIPLIER = float(ARGS.task4_gemini_verifier_retry_token_multiplier)
 BUNDLE_TARGET = TARGET_BUNDLE
 
 CANON_CAMS = [f"Cam{i}" for i in range(1, 7)]
@@ -630,6 +764,11 @@ REJECT_STATS = {
     "t1_all_anchor_candidates_failed": 0,
     "t1_pose_mismatch": 0,
     "t1_conf_below_threshold": 0,
+    "t1_teacher_second_call": 0,
+    "t1_teacher_fallback": 0,
+    "t1_teacher_conflict": 0,
+    "t1_teacher_parse_fail": 0,
+    "t1_teacher_partial_retry": 0,
 
     "t2_no_tri": 0,
     "t2_no_cam_centers": 0,
@@ -644,7 +783,12 @@ REJECT_STATS = {
     "t4_object_not_in_view": 0,
     "t4_inconsistent_gt": 0,
     "t4_verifier_fail": 0,
+    "t4_gemini_verifier_parse_fail": 0,
+    "t4_gemini_verifier_presence_conflict": 0,
+    "t4_gemini_verifier_person_not_present": 0,
     "t4_no_visibility": 0,
+    "t4_gemini_verify_flip": 0,
+    "t4_gemini_verify_reject": 0,
     "frame_missing_task1": 0,
     "frame_missing_task2": 0,
     "frame_missing_task3": 0,

@@ -588,30 +588,231 @@ def _extract_gemini_finish_reason(data):
     return ""
 
 
-def _gemini_generate(images, prompt, max_new_tokens, model_id=None, generation_cfg=None):
+def _strip_json_fence(text):
+    s = str(text or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.I)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+
+def _gemini_json_parse_health(text):
+    s = _strip_json_fence(text)
+    if not s:
+        return {"parse_ok": False, "partial": False, "status": "empty"}
+    try:
+        json.loads(s)
+        return {"parse_ok": True, "partial": False, "status": "ok"}
+    except Exception:
+        pass
+    opens = s.count("{")
+    closes = s.count("}")
+    partial = opens > closes or s.endswith(":") or s.endswith(",") or s.endswith('"')
+    return {"parse_ok": False, "partial": bool(partial), "status": "invalid"}
+
+
+def _is_gemini3_model(model_name):
+    return _normalize_model_name(model_name).startswith("gemini-3")
+
+
+def _extract_gemini_model_content(data):
+    candidates = data.get("candidates") or []
+    for cand in candidates:
+        if not isinstance(cand, dict):
+            continue
+        content = cand.get("content") or {}
+        parts = content.get("parts") or []
+        cleaned_parts = []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            p = {}
+            if "text" in part:
+                p["text"] = str(part.get("text") or "")
+            ts = part.get("thoughtSignature")
+            if ts is None:
+                ts = part.get("thought_signature")
+            if ts:
+                p["thoughtSignature"] = str(ts)
+            # Function-call fields are preserved for forward compatibility.
+            if isinstance(part.get("functionCall"), dict):
+                p["functionCall"] = part["functionCall"]
+            if isinstance(part.get("functionResponse"), dict):
+                p["functionResponse"] = part["functionResponse"]
+            if p:
+                cleaned_parts.append(p)
+        if cleaned_parts:
+            role = str(content.get("role") or "model").strip().lower()
+            if role not in {"user", "model"}:
+                role = "model"
+            return {"role": role, "parts": cleaned_parts}
+    return {"role": "model", "parts": []}
+
+
+def _extract_gemini_thought_signatures(model_content):
+    out = []
+    if not isinstance(model_content, dict):
+        return out
+    for part in model_content.get("parts") or []:
+        if not isinstance(part, dict):
+            continue
+        ts = part.get("thoughtSignature")
+        if ts:
+            out.append(str(ts))
+    return out
+
+
+def _sanitize_gemini_history_contents(contents):
+    if not isinstance(contents, list):
+        return []
+    allowed_part_keys = {
+        "text",
+        "inlineData",
+        "fileData",
+        "functionCall",
+        "functionResponse",
+        "executableCode",
+        "codeExecutionResult",
+        "thoughtSignature",
+        "mediaResolution",
+    }
+    out = []
+    for c in contents:
+        if not isinstance(c, dict):
+            continue
+        role = str(c.get("role") or "user").strip().lower()
+        if role not in {"user", "model"}:
+            role = "user"
+        parts_in = c.get("parts") or []
+        parts_out = []
+        if isinstance(parts_in, list):
+            for p in parts_in:
+                if not isinstance(p, dict):
+                    continue
+                q = {}
+                for k in allowed_part_keys:
+                    if k in p and p.get(k) is not None:
+                        q[k] = p.get(k)
+                ts = p.get("thought_signature")
+                if ts and "thoughtSignature" not in q:
+                    q["thoughtSignature"] = ts
+                if q:
+                    parts_out.append(q)
+        if parts_out:
+            out.append({"role": role, "parts": parts_out})
+    return out
+
+
+def _normalize_gemini_thinking_level(v):
+    s = str(v or "high").strip().lower()
+    if s not in {"minimal", "low", "medium", "high"}:
+        s = "high"
+    return s
+
+
+def _normalize_gemini_media_resolution(v):
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if not s:
+        return None
+    aliases = {
+        "low": "MEDIA_RESOLUTION_LOW",
+        "medium": "MEDIA_RESOLUTION_MEDIUM",
+        "high": "MEDIA_RESOLUTION_HIGH",
+        "ultra_high": "MEDIA_RESOLUTION_ULTRA_HIGH",
+        "ultra-high": "MEDIA_RESOLUTION_ULTRA_HIGH",
+    }
+    if s in aliases:
+        return aliases[s]
+    s2 = s.replace("-", "_").upper()
+    if s2.startswith("MEDIA_RESOLUTION_"):
+        return s2
+    return f"MEDIA_RESOLUTION_{s2}"
+
+
+def _gemini_api_versions_for_request(cfg, per_part_requested=False):
+    req = str(cfg.get("api_version") or os.environ.get("GEMINI_API_VERSION", "v1beta")).strip().lower()
+    if req not in {"v1beta", "v1alpha"}:
+        req = "v1beta"
+    allow_fallback = bool(cfg.get("allow_version_fallback", True))
+
+    ordered = []
+    if per_part_requested:
+        ordered.extend(["v1alpha", req])
+    else:
+        ordered.append(req)
+    if allow_fallback:
+        ordered.extend(["v1beta", "v1alpha"])
+
+    out = []
+    seen = set()
+    for v in ordered:
+        if v in {"v1beta", "v1alpha"} and v not in seen:
+            out.append(v)
+            seen.add(v)
+    return out or ["v1beta"]
+
+
+def _gemini_generate(images, prompt, max_new_tokens, model_id=None, generation_cfg=None, return_meta=False):
     api_key = _require_gemini_api_key()
     pil_images = _normalize_pil_images(images)
     cfg = generation_cfg or {}
     model_name = str(model_id or st.VLM_MODEL_ID).strip()
 
-    parts = [{"text": prompt}]
-    for pil in pil_images:
-        b64 = _pil_to_jpeg_b64(pil)
-        parts.append({
-            "inlineData": {
-                "mimeType": "image/jpeg",
-                "data": b64,
-            }
-        })
+    history_contents = _sanitize_gemini_history_contents(
+        cfg.get("history_contents") or cfg.get("gemini_history_contents") or []
+    )
+    encoded_images = [_pil_to_jpeg_b64(pil) for pil in pil_images]
+    media_resolution_enum = _normalize_gemini_media_resolution(cfg.get("media_resolution"))
+    media_resolution_scope = str(cfg.get("media_resolution_scope", "auto")).strip().lower()
+    if media_resolution_scope not in {"global", "per_part", "auto"}:
+        media_resolution_scope = "global"
 
-    def _build_payload(tok_budget):
+    def _build_user_parts(api_version, include_advanced, model_used):
+        parts_local = [{"text": prompt}]
+        per_part_enabled = (
+            include_advanced
+            and bool(media_resolution_enum)
+            and _is_gemini3_model(model_used)
+            and (
+                media_resolution_scope == "per_part"
+                or (media_resolution_scope == "auto" and media_resolution_enum == "MEDIA_RESOLUTION_ULTRA_HIGH")
+            )
+            and api_version == "v1alpha"
+        )
+        for b64 in encoded_images:
+            part = {
+                "inlineData": {
+                    "mimeType": "image/jpeg",
+                    "data": b64,
+                }
+            }
+            if per_part_enabled:
+                part["mediaResolution"] = {"level": str(media_resolution_enum).lower()}
+            parts_local.append(part)
+        return parts_local, per_part_enabled
+
+    def _build_payload(
+        tok_budget,
+        api_version,
+        active_model,
+        include_advanced=True,
+        include_thinking=True,
+        include_structured=False,
+    ):
         temperature = float(cfg.get("temperature", 0))
         top_p = cfg.get("top_p")
         top_k = cfg.get("top_k")
         candidate_count = cfg.get("candidate_count")
-        thinking_budget = cfg.get("thinking_budget", st.GEMINI_THINKING_BUDGET)
+        thinking_budget = int(cfg.get("thinking_budget", st.GEMINI_THINKING_BUDGET))
+        thinking_level = _normalize_gemini_thinking_level(cfg.get("thinking_level", "high"))
+        structured_json = bool(cfg.get("structured_json", False))
+        json_schema = cfg.get("json_schema")
+        user_parts, per_part_enabled = _build_user_parts(api_version, include_advanced, active_model)
+
         payload_local = {
-            "contents": [{"role": "user", "parts": parts}],
+            "contents": history_contents + [{"role": "user", "parts": user_parts}],
             "generationConfig": {
                 "maxOutputTokens": int(tok_budget),
                 "temperature": temperature,
@@ -623,71 +824,329 @@ def _gemini_generate(images, prompt, max_new_tokens, model_id=None, generation_c
             payload_local["generationConfig"]["topK"] = int(top_k)
         if candidate_count is not None:
             payload_local["generationConfig"]["candidateCount"] = int(candidate_count)
-        # Gemini 2.5 can spend budget on "thinking" and return empty parts when capped.
-        # Defaulting this to 0 (configurable) improves short-label stability.
-        payload_local["generationConfig"]["thinkingConfig"] = {
-            "thinkingBudget": int(thinking_budget),
-        }
-        return payload_local
-
-    url = f"{st.GEMINI_API_BASE.rstrip('/')}/v1beta/models/{model_name}:generateContent?key={api_key}"
-    headers = {"Content-Type": "application/json"}
-    token_budgets = [int(max_new_tokens)]
-    if int(max_new_tokens) < 128:
-        token_budgets.append(max(128, int(max_new_tokens) * 2))
-
-    last_data = None
-    for attempt_i, tok_budget in enumerate(token_budgets, start=1):
-        payload = _build_payload(tok_budget)
-        try:
-            data = _post_json(url, headers, payload, provider_name="Gemini")
-        except RuntimeError as e:
-            if _is_transient_api_error_message(e):
+        if include_advanced and (not per_part_enabled) and media_resolution_enum:
+            mr = str(media_resolution_enum)
+            if mr == "MEDIA_RESOLUTION_ULTRA_HIGH" and api_version != "v1alpha":
                 st.logger.warning(
-                    "Gemini transient API failure after bounded retries; returning empty output for this call."
+                    "Gemini ultra_high media resolution requested without v1alpha per-part path; "
+                    "downgrading to MEDIA_RESOLUTION_HIGH."
                 )
-                return ""
-            raise
-        last_data = data
+                mr = "MEDIA_RESOLUTION_HIGH"
+            payload_local["generationConfig"]["mediaResolution"] = mr
+        if include_thinking:
+            # Gemini 3 uses thinkingLevel; 2.5/legacy uses thinkingBudget.
+            thinking_cfg = {}
+            if _is_gemini3_model(active_model):
+                thinking_cfg["thinkingLevel"] = thinking_level
+            else:
+                thinking_cfg["thinkingBudget"] = max(0, int(thinking_budget))
+            payload_local["generationConfig"]["thinkingConfig"] = thinking_cfg
+        if include_structured and structured_json:
+            payload_local["generationConfig"]["responseMimeType"] = "application/json"
+            if isinstance(json_schema, dict) and json_schema:
+                payload_local["generationConfig"]["responseSchema"] = json_schema
+        return payload_local, per_part_enabled
 
-        usage = _extract_gemini_usage(data)
-        if usage is not None:
-            _record_usage(
-                "gemini",
-                model_name,
-                input_tokens=usage["input_tokens"],
-                output_tokens=usage["output_tokens"],
-                cached_input_tokens=usage["cached_input_tokens"],
-                total_tokens=usage["total_tokens"],
-            )
-
-        text = _extract_gemini_text(data)
-        if text:
-            return text
-
-        finish_reason = _extract_gemini_finish_reason(data).upper()
-        if finish_reason == "MAX_TOKENS" and attempt_i < len(token_budgets):
-            st.logger.warning(
-                f"Gemini produced no text with finishReason=MAX_TOKENS; retrying "
-                f"with maxOutputTokens={token_budgets[attempt_i]}"
-            )
-            continue
-        break
-
-    fb = (last_data or {}).get("promptFeedback")
-    if fb:
-        st.logger.warning(f"Gemini returned no text output. promptFeedback={fb}")
-        return ""
-
-    finish_reason = _extract_gemini_finish_reason(last_data or {}).upper()
-    if finish_reason:
-        st.logger.warning(
-            f"Gemini returned no text output (finishReason={finish_reason}). "
-            "Returning empty string."
+    def _is_schema_compat_error(err):
+        txt = str(err or "").lower()
+        return (
+            "unknown name" in txt
+            or "invalid json payload" in txt
+            or "unsupported" in txt
+            or "invalid argument" in txt
+            or "unknown field" in txt
         )
-        return ""
-    st.logger.warning(f"Gemini returned no text output: {str(last_data)[:800]}")
-    return ""
+
+    def _is_model_not_found_error(err):
+        txt = str(err or "").lower()
+        return (
+            "gemini api error 404" in txt
+            and (
+                "is not found" in txt
+                or "not found for api version" in txt
+                or "not supported for generatecontent" in txt
+            )
+        )
+
+    def _is_bad_request_error(err):
+        txt = str(err or "").lower()
+        return "gemini api error 400" in txt
+
+    def _model_candidates(primary_model):
+        defaults = [
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+        ]
+        env_raw = str(os.environ.get("GEMINI_FALLBACK_MODELS", "")).strip()
+        env_models = [m.strip() for m in re.split(r"[,\s]+", env_raw) if m.strip()] if env_raw else []
+        ordered = [str(primary_model or "").strip()] + env_models + defaults
+        out = []
+        seen = set()
+        for m in ordered:
+            if not m:
+                continue
+            key = m.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(m)
+        return out
+
+    def _build_meta(
+        text,
+        active_model,
+        api_version,
+        mode_used,
+        data_obj,
+        finish_reason=None,
+        error=None,
+        token_budget_used=None,
+        retry_count=0,
+        schema_enabled=False,
+        parse_health=None,
+    ):
+        model_content = _extract_gemini_model_content(data_obj or {})
+        thought_sigs = _extract_gemini_thought_signatures(model_content)
+        history_turn = []
+        if prompt:
+            history_turn.append({"role": "user", "parts": [{"text": prompt}]})
+        if model_content.get("parts"):
+            history_turn.append(model_content)
+        return {
+            "text": text or "",
+            "provider": "gemini",
+            "model_requested": model_name,
+            "model_used": active_model or model_name,
+            "api_version_used": api_version or "v1beta",
+            "mode_used": mode_used or "full",
+            "finish_reason": str(finish_reason or ""),
+            "token_budget_used": int(token_budget_used or 0),
+            "retry_count": int(max(0, retry_count or 0)),
+            "schema_enabled": bool(schema_enabled),
+            "parse_health": parse_health if isinstance(parse_health, dict) else None,
+            "thought_signature_count": int(len(thought_sigs)),
+            "thought_signatures": thought_sigs,
+            "history_turn": history_turn,
+            "error": str(error or ""),
+        }
+
+    headers = {"Content-Type": "application/json"}
+    base_budget = max(1, int(max_new_tokens))
+    structured_requested = bool(cfg.get("structured_json", False))
+    retry_on_partial_json = bool(cfg.get("retry_on_partial_json", False))
+    try:
+        retry_token_multiplier = float(cfg.get("retry_token_multiplier", 2.0))
+    except Exception:
+        retry_token_multiplier = 2.0
+    if retry_token_multiplier < 1.1:
+        retry_token_multiplier = 1.1
+    token_budgets = [base_budget]
+    retry_budget = int(math.ceil(base_budget * retry_token_multiplier))
+    if retry_budget > base_budget:
+        token_budgets.append(retry_budget)
+    if base_budget < 128:
+        token_budgets.append(max(128, base_budget * 2))
+    # De-duplicate while preserving order.
+    token_budgets = list(dict.fromkeys(token_budgets))
+    per_part_requested = (
+        media_resolution_scope == "per_part"
+        or (media_resolution_scope == "auto" and media_resolution_enum == "MEDIA_RESOLUTION_ULTRA_HIGH")
+    )
+    api_versions = _gemini_api_versions_for_request(cfg, per_part_requested=per_part_requested)
+
+    payload_modes = []
+    if structured_requested:
+        payload_modes.extend([
+            ("structured_full", True, True, True),
+            ("structured_no_advanced", False, True, True),
+            ("structured_minimal", False, False, True),
+        ])
+    payload_modes.extend([
+        ("full", True, True, False),
+        ("no_advanced", False, True, False),
+        ("minimal", False, False, False),
+    ])
+    last_err = None
+    for model_i, active_model in enumerate(_model_candidates(model_name), start=1):
+        if model_i > 1:
+            st.logger.warning(
+                f"Gemini model fallback active: requested='{model_name}', trying='{active_model}'."
+            )
+        for api_version in api_versions:
+            url = f"{st.GEMINI_API_BASE.rstrip('/')}/{api_version}/models/{active_model}:generateContent?key={api_key}"
+            last_data = None
+            try:
+                for attempt_i, tok_budget in enumerate(token_budgets, start=1):
+                    data = None
+                    mode_used = None
+                    mode_err = None
+                    for mode_name, use_adv, use_thinking, use_structured in payload_modes:
+                        payload, per_part_enabled = _build_payload(
+                            tok_budget,
+                            api_version=api_version,
+                            active_model=active_model,
+                            include_advanced=use_adv,
+                            include_thinking=use_thinking,
+                            include_structured=use_structured,
+                        )
+                        try:
+                            data = _post_json(url, headers, payload, provider_name="Gemini")
+                            mode_used = mode_name
+                            if per_part_enabled:
+                                st.logger.info("Gemini per-part media resolution path enabled.")
+                            break
+                        except RuntimeError as e:
+                            mode_err = e
+                            if _is_transient_api_error_message(e):
+                                st.logger.warning(
+                                    "Gemini transient API failure after bounded retries; returning empty output for this call."
+                                )
+                                if return_meta:
+                                    return _build_meta(
+                                        "",
+                                        active_model=active_model,
+                                        api_version=api_version,
+                                        mode_used=mode_name,
+                                        data_obj={},
+                                        error=e,
+                                    )
+                                return ""
+                            if _is_schema_compat_error(e):
+                                st.logger.warning(
+                                    f"Gemini config mode '{mode_name}' rejected by endpoint; trying compatibility fallback."
+                                )
+                                continue
+                            raise
+                    if data is None:
+                        if mode_err is not None:
+                            raise mode_err
+                        raise RuntimeError("Gemini request failed before receiving response data.")
+
+                    if mode_used and mode_used != "full":
+                        st.logger.warning(f"Gemini request used compatibility mode: {mode_used}")
+                    last_data = data
+
+                    usage = _extract_gemini_usage(data)
+                    if usage is not None:
+                        _record_usage(
+                            "gemini",
+                            active_model,
+                            input_tokens=usage["input_tokens"],
+                            output_tokens=usage["output_tokens"],
+                            cached_input_tokens=usage["cached_input_tokens"],
+                            total_tokens=usage["total_tokens"],
+                        )
+
+                    finish_reason = _extract_gemini_finish_reason(data).upper()
+                    text = _extract_gemini_text(data)
+                    parse_health = None
+                    if structured_requested:
+                        parse_health = _gemini_json_parse_health(text)
+                    if text:
+                        should_retry_partial = (
+                            structured_requested
+                            and retry_on_partial_json
+                            and attempt_i < len(token_budgets)
+                            and (
+                                (isinstance(parse_health, dict) and (not bool(parse_health.get("parse_ok"))))
+                                or finish_reason == "MAX_TOKENS"
+                            )
+                        )
+                        if should_retry_partial:
+                            st.logger.warning(
+                                "Gemini produced partial/invalid JSON; retrying "
+                                f"with maxOutputTokens={token_budgets[attempt_i]}"
+                            )
+                            continue
+                        if return_meta:
+                            return _build_meta(
+                                text,
+                                active_model=active_model,
+                                api_version=api_version,
+                                mode_used=mode_used,
+                                data_obj=data,
+                                finish_reason=finish_reason,
+                                token_budget_used=tok_budget,
+                                retry_count=(attempt_i - 1),
+                                schema_enabled=bool(mode_used and mode_used.startswith("structured_")),
+                                parse_health=parse_health,
+                            )
+                        return text
+
+                    if finish_reason == "MAX_TOKENS" and attempt_i < len(token_budgets):
+                        st.logger.warning(
+                            f"Gemini produced no text with finishReason=MAX_TOKENS; retrying "
+                            f"with maxOutputTokens={token_budgets[attempt_i]}"
+                        )
+                        continue
+                    break
+
+                fb = (last_data or {}).get("promptFeedback")
+                if fb:
+                    st.logger.warning(f"Gemini returned no text output. promptFeedback={fb}")
+                    if return_meta:
+                        return _build_meta(
+                            "",
+                            active_model=active_model,
+                            api_version=api_version,
+                            mode_used=mode_used,
+                            data_obj=last_data or {},
+                            token_budget_used=tok_budget if "tok_budget" in locals() else 0,
+                            retry_count=(attempt_i - 1) if "attempt_i" in locals() else 0,
+                            schema_enabled=bool(mode_used and str(mode_used).startswith("structured_")),
+                        )
+                    return ""
+
+                finish_reason = _extract_gemini_finish_reason(last_data or {}).upper()
+                if finish_reason:
+                    st.logger.warning(
+                        f"Gemini returned no text output (finishReason={finish_reason}). "
+                        "Returning empty string."
+                    )
+                    if return_meta:
+                        return _build_meta(
+                            "",
+                            active_model=active_model,
+                            api_version=api_version,
+                            mode_used=mode_used,
+                            data_obj=last_data or {},
+                            finish_reason=finish_reason,
+                            token_budget_used=tok_budget if "tok_budget" in locals() else 0,
+                            retry_count=(attempt_i - 1) if "attempt_i" in locals() else 0,
+                            schema_enabled=bool(mode_used and str(mode_used).startswith("structured_")),
+                        )
+                    return ""
+                st.logger.warning(f"Gemini returned no text output: {str(last_data)[:800]}")
+                if return_meta:
+                    return _build_meta(
+                        "",
+                        active_model=active_model,
+                        api_version=api_version,
+                        mode_used=mode_used,
+                        data_obj=last_data or {},
+                        token_budget_used=tok_budget if "tok_budget" in locals() else 0,
+                        retry_count=(attempt_i - 1) if "attempt_i" in locals() else 0,
+                        schema_enabled=bool(mode_used and str(mode_used).startswith("structured_")),
+                    )
+                return ""
+            except RuntimeError as e:
+                last_err = e
+                if _is_model_not_found_error(e):
+                    st.logger.warning(
+                        f"Gemini model '{active_model}' unavailable for API {api_version}; trying next candidate."
+                    )
+                    continue
+                if _is_bad_request_error(e) and _is_gemini3_model(active_model):
+                    st.logger.warning(
+                        f"Gemini 3 request rejected on API {api_version}; attempting next API/model fallback."
+                    )
+                    continue
+                raise
+
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("Gemini model resolution failed without a usable candidate.")
 
 
 def _default_model_for_provider(provider_name):
@@ -701,11 +1160,28 @@ def _default_model_for_provider(provider_name):
     return str(st.VLM_MODEL_ID)
 
 
-def vlm_generate(images, prompt, max_new_tokens=128, provider=None, model_id=None, generation_cfg=None):
+def vlm_generate(
+    images,
+    prompt,
+    max_new_tokens=128,
+    provider=None,
+    model_id=None,
+    generation_cfg=None,
+    return_meta=False,
+):
     global _vlm_calls
     _vlm_calls += 1
 
     if st.ARGS.skip_vlm:
+        if return_meta:
+            return {
+                "text": "SKIP_VLM",
+                "provider": str(provider or st.VLM_PROVIDER),
+                "model_requested": str(model_id or st.VLM_MODEL_ID),
+                "model_used": str(model_id or st.VLM_MODEL_ID),
+                "mode_used": "skip_vlm",
+                "error": "",
+            }
         return "SKIP_VLM"
 
     provider_name = str(provider or st.VLM_PROVIDER).strip().lower()
@@ -738,6 +1214,14 @@ def vlm_generate(images, prompt, max_new_tokens=128, provider=None, model_id=Non
                 f"[VLM] qwen override model '{resolved_model}' ignored; using loaded model '{st.QWEN_MODEL_ID}'."
             )
         pred = _qwen_generate(images, prompt, max_new_tokens=max_new_tokens)
+        meta = {
+            "text": pred,
+            "provider": "qwen",
+            "model_requested": resolved_model,
+            "model_used": str(st.QWEN_MODEL_ID),
+            "mode_used": "default",
+            "error": "",
+        }
     elif provider_name == "openai":
         pred = _openai_generate(
             images,
@@ -746,20 +1230,44 @@ def vlm_generate(images, prompt, max_new_tokens=128, provider=None, model_id=Non
             model_id=resolved_model,
             generation_cfg=generation_cfg,
         )
+        meta = {
+            "text": pred,
+            "provider": "openai",
+            "model_requested": resolved_model,
+            "model_used": resolved_model,
+            "mode_used": "default",
+            "error": "",
+        }
     elif provider_name == "gemini":
-        pred = _gemini_generate(
+        gem_resp = _gemini_generate(
             images,
             prompt,
             max_new_tokens=max_new_tokens,
             model_id=resolved_model,
             generation_cfg=generation_cfg,
+            return_meta=bool(return_meta),
         )
+        if return_meta and isinstance(gem_resp, dict):
+            meta = gem_resp
+            pred = str(meta.get("text") or "")
+        else:
+            pred = str(gem_resp or "")
+            meta = {
+                "text": pred,
+                "provider": "gemini",
+                "model_requested": resolved_model,
+                "model_used": resolved_model,
+                "mode_used": "default",
+                "error": "",
+            }
     else:
         raise ValueError(f"Unsupported VLM provider: {provider_name}")
 
     if st.ARGS.log_prompts:
         st.logger.info(f"[VLM] output:\n{pred}")
 
+    if return_meta:
+        return meta
     return pred
 
 

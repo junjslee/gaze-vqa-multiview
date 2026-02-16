@@ -96,7 +96,7 @@ def prompt_target_description_ray(person_desc, anchor_cam, scene_type=None):
     """Task1: describe gaze target using a ray+arrow overlay image."""
     who = person_ref(person_desc)
     return (
-        f"In {lc(anchor_cam)}, a red line indicates the gaze direction of {lc(who)} and points to the target with a small red arrowhead near the target location.\n"
+        f"In {lc(anchor_cam)}, a red line indicates the gaze direction of {lc(who)} and points to the target with a small red arrowhead near the target location (target markers like arrow/ring/crosshair are cues, not objects; if the true object is a tomato, output tomato/red tomato).\n"
         "The arrow marker is intentionally offset a little from the exact target point to avoid covering the object.\n"
         "Describe the specific thing they are looking at in 1-2 sentences.\n"
         "Use 'on' ONLY if the object is clearly resting on a surface (visible contact) and realistic. "
@@ -117,7 +117,7 @@ def prompt_distill_object_phrase(target_description, scene_type=None):
         "- 1 to 4 words\n"
         "- No verbs, no 'the'\n"
         "- Avoid generic terms like 'furniture' or 'object', 'thing', 'square/box'\n"
-        "- Do not mention dots, arrows, lines, rays, or overlays\n"
+        "- Do not mention marker cues (ring/crosshair), arrows, lines, rays, or overlays; do not confuse cue markers with real objects, and if the true object is a tomato output tomato/red tomato\n"
         "- If the description is ambiguous, output your best concrete guess\n"
         "- Use 'on' ONLY if contact is visually obvious; avoid 'on' for 2D alignment (e.g., wall AC above a table), no vague objects should be mentioned even if it's on it\n"
         "- If a small item (clearly distinguishable) sits on a larger surface, you may return '<small> on <large>'\n"
@@ -131,6 +131,7 @@ def prompt_masked_object(scene_type=None):
     return (
         "You see a target object crop.\n"
         "If two images are provided: image A is the raw crop; image B is the same crop with a semi-transparent mask overlay.\n"
+        "Do not confuse overlay cue colors/marks with real objects; if the true object is a tomato, output tomato/red tomato.\n"
         "If multiple objects appear, name the one highlighted by the mask.\n"
         "Return ONLY a short noun phrase naming the object.\n"
         "Rules: 1-4 words. No verbs. No punctuation.\n"
@@ -170,21 +171,21 @@ def prompt_judge_same_object_phrase(label_a, label_b, scene_type=None):
 
 
 def prompt_reconcile_triple(ray_label, mask_label, dot_label, ray_desc=None, dot_desc=None, scene_type=None):
-    """Task1: reconcile ray/mask/dot labels into one canonical phrase."""
+    """Task1: reconcile ray/mask/marker labels into one canonical phrase."""
     prompt = (
         "You are consolidating three independently generated object labels into ONE canonical noun phrase.\n"
         "Return ONLY a 1-4 word noun phrase. No verbs. No punctuation.\n"
         "Use 'on' ONLY if contact is visually obvious; avoid 'on' for 2D alignment.\n"
         "If one label is a small item on a larger surface, you may return '<small> on <large>'.\n"
-        "Do NOT mention dots, lines, rays, or overlays.\n"
+        "Do NOT mention marker cues (ring/crosshair), lines, rays, or overlays. Do not confuse cue markers with real objects; if the true object is a tomato, output tomato/red tomato.\n"
         f"Label from ray cue: {lc(ray_label)}\n"
         f"Label from mask cue: {lc(mask_label)}\n"
-        f"Label from dot cue: {lc(dot_label)}\n"
+        f"Label from marker cue: {lc(dot_label)}\n"
     )
     if ray_desc:
         prompt += f"\nRay description: {lc(ray_desc)}\n"
     if dot_desc:
-        prompt += f"Dot description: {lc(dot_desc)}\n"
+        prompt += f"Marker description: {lc(dot_desc)}\n"
     return prompt
 
 
@@ -205,7 +206,8 @@ def prompt_task1_reasoning_rich(person_desc, canonical_object, scene_type=None):
         f"Write 1-2 sentences explaining why the {lc(person_desc)} is looking at the '{lc(canonical_object)}'. "
         "Ground the explanation in visible spatial cues: head direction, body orientation, left/right/behind, "
         "and relative placement of the object.\n"
-        "Do not mention overlays, gaze rays, masks, annotations, or ground-truth sources."
+        "Do not mention overlays, gaze rays, masks, annotations, or ground-truth sources. "
+        "Do not treat cue marks (ring/crosshair marker) as real objects (e.g., red tomato)."
     )
 
 
@@ -243,14 +245,15 @@ def prompt_task1_semantic_arbiter(
         "You are resolving conflicting gaze-target labels for dataset quality.\n"
         "Interpret the images as follows:\n"
         "1) segmented mask crop at gaze target\n"
-        "2) same crop with target dot\n"
+        "2) same crop with target marker (ring/crosshair)\n"
         "3) cue-rich full image (person bbox + gaze ray + mask)\n"
         "4) full raw scene context\n"
         "Goal: return the most accurate concrete object identity that "
         f"{lc(who)} is looking at in {lc(anchor_cam)}.\n"
         "Prefer full object identity over partial fragments. "
         "Use scene context to disambiguate tiny patches.\n"
-        "Avoid generic words ('object', 'thing', 'furniture') and avoid mentions of overlays/rays/dots.\n"
+        "Avoid generic words ('object', 'thing', 'furniture') and avoid mentions of overlays/rays/marker cues (ring/crosshair). "
+        "Do not confuse cue markers with real objects; if the true object is a tomato, output tomato/red tomato.\n"
         "Use 'on' only when true physical support is visually clear.\n"
         f"Mask area ratio: {mar_txt}. Ray cue: {ray_txt}.\n"
         "Candidate labels:\n"
@@ -260,6 +263,69 @@ def prompt_task1_semantic_arbiter(
         "DECISION: <KEEP|SWITCH_MASK|SWITCH_DOT|SWITCH_RAY|SWITCH_MV|REFINE|UNSURE>\n"
         "CONFIDENCE: <HIGH|MEDIUM|LOW>\n"
         "RATIONALE: <max 14 words>"
+    )
+
+
+def prompt_task1_teacher_pass1(
+    person_desc,
+    anchor_cam,
+    student_label,
+    candidate_labels,
+    scene_type=None,
+    mask_area_ratio=None,
+):
+    """Task1: Gemini teacher pass-1 (single-image gaze-ray adjudication)."""
+    who = person_ref(person_desc)
+    lines = []
+    for key, val in (candidate_labels or {}).items():
+        if val:
+            lines.append(f"- {key}: {lc(val)}")
+    cand_block = "\n".join(lines) if lines else "- none"
+    mar_txt = "N/A" if mask_area_ratio is None else f"{float(mask_area_ratio):.4f}"
+    return (
+        "You are a strict teacher for gaze-target labeling quality.\n"
+        "You receive one image only: the original scene with gaze-ray overlay.\n"
+        "Use the ray direction and surrounding scene context to identify the target object.\n"
+        "Do not confuse cue markers with real objects. "
+        "If the real object is a tomato, output tomato/red tomato.\n"
+        f"Person: {lc(who)}. Anchor camera: {lc(anchor_cam)}. Scene: {lc(scene_type)}.\n"
+        f"Qwen student label: {lc(student_label) if student_label else 'none'}\n"
+        f"Mask area ratio: {mar_txt}\n"
+        "Candidate labels from student pipeline:\n"
+        f"{cand_block}\n"
+        "Output ONLY valid JSON with this exact schema (no markdown, no extra keys):\n"
+        '{"final_label":"<1-4 words>","qwen_verdict":"CORRECT|INCORRECT|UNCLEAR","confidence":"HIGH|MEDIUM|LOW"}'
+    )
+
+
+def prompt_task1_teacher_pass2_conflict(
+    person_desc,
+    anchor_cam,
+    student_label,
+    teacher_label_pass1,
+    candidate_labels,
+    scene_type=None,
+):
+    """Task1: Gemini teacher pass-2 conflict resolver (single-image)."""
+    who = person_ref(person_desc)
+    lines = []
+    for key, val in (candidate_labels or {}).items():
+        if val:
+            lines.append(f"- {key}: {lc(val)}")
+    cand_block = "\n".join(lines) if lines else "- none"
+    return (
+        "You are resolving a disagreement between student and teacher labels.\n"
+        "You receive one image only: the original scene with gaze-ray overlay.\n"
+        "Choose one final canonical target label using ray direction and semantic context.\n"
+        "Do not confuse cue markers with real objects. "
+        "If the real object is a tomato, output tomato/red tomato.\n"
+        f"Person: {lc(who)}. Anchor camera: {lc(anchor_cam)}. Scene: {lc(scene_type)}.\n"
+        f"Qwen student label: {lc(student_label) if student_label else 'none'}\n"
+        f"Teacher pass-1 label: {lc(teacher_label_pass1) if teacher_label_pass1 else 'none'}\n"
+        "Candidate labels from student pipeline:\n"
+        f"{cand_block}\n"
+        "Output ONLY valid JSON with this exact schema (no markdown, no extra keys):\n"
+        '{"final_label":"<1-4 words>","qwen_verdict":"CORRECT|INCORRECT|UNCLEAR","confidence":"HIGH|MEDIUM|LOW"}'
     )
 
 
@@ -370,6 +436,23 @@ def prompt_task4_verify(answer_yesno, obj_phrase, person_desc, explanation, scen
         "PASS\n"
         "or\n"
         "FAIL"
+    )
+
+
+def prompt_task4_gemini_visibility_verify(answer_yesno, obj_phrase, person_desc, query_cam, scene_type=None):
+    """Task4: Gemini visibility verifier over queried object visibility."""
+    who = person_ref(person_desc)
+    return (
+        "You are verifying if the queried object is visible within the person's line of sight.\n"
+        f"Camera: {lc(query_cam)}. Scene: {lc(scene_type)}.\n"
+        f"Person: {lc(who)}\n"
+        f"Queried object: {lc(obj_phrase)}\n"
+        f"Current pipeline answer: {lc(answer_yesno)}\n"
+        "First verify whether the person is present in this image.\n"
+        "Then verify whether the queried object is present in this image.\n"
+        "Then judge line-of-sight visibility.\n"
+        "Return ONLY valid JSON (no markdown, no extra keys):\n"
+        '{"prediction":"YES|NO","presence":"PRESENT|NOT_PRESENT|UNCLEAR","person_presence":"PRESENT|NOT_PRESENT|UNCLEAR","confidence":"HIGH|MEDIUM|LOW","rationale":"<max 16 words>"}'
     )
 
 

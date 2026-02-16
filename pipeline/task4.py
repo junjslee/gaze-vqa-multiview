@@ -1,7 +1,9 @@
 # task4.py
+import json
 from collections import Counter
 import random
 import math
+import re
 import numpy as np
 from PIL import ImageDraw
 from pathlib import Path
@@ -36,6 +38,199 @@ def verify_reasoning_with_pixels(images, answer_yesno, explanation, obj_phrase, 
     prompt = prompts.prompt_task4_verify(answer_yesno, obj_phrase, person_desc, explanation, scene_type=scene_type)
     raw = vlm_generate(images, prompt, max_new_tokens=8).strip().upper()
     return raw.startswith("PASS"), raw
+
+
+def _task4_conf_rank(conf):
+    return {"LOW": 0, "MEDIUM": 1, "HIGH": 2}.get(str(conf or "LOW").upper(), 0)
+
+
+def _task4_parse_gemini_visibility_output(raw):
+    txt = (raw or "").strip()
+    out = {
+        "prediction": None,
+        "presence": None,
+        "person_presence": None,
+        "confidence": "LOW",
+        "rationale": None,
+        "parse_ok": False,
+        "parse_status": "invalid",
+        "parse_partial": False,
+        "parse_reason": None,
+        "raw": txt,
+    }
+    obj = None
+    recovered_partial = False
+    if txt:
+        try:
+            obj = json.loads(txt)
+        except Exception:
+            m = None
+            try:
+                m = re.search(r"\{.*\}", txt, flags=re.S)
+            except Exception:
+                m = None
+            if m:
+                try:
+                    obj = json.loads(m.group(0))
+                except Exception:
+                    obj = None
+    if isinstance(obj, dict):
+        out["prediction"] = obj.get("prediction")
+        out["presence"] = obj.get("presence")
+        out["person_presence"] = obj.get("person_presence")
+        out["confidence"] = obj.get("confidence", out["confidence"])
+        out["rationale"] = obj.get("rationale")
+    else:
+        m = re.search(r'"prediction"\s*:\s*"([A-Z]+)', txt, flags=re.I)
+        if m:
+            out["prediction"] = m.group(1).strip().upper()
+            recovered_partial = True
+        m = re.search(r'"presence"\s*:\s*"([A-Z_]+)', txt, flags=re.I)
+        if m:
+            out["presence"] = m.group(1).strip().upper()
+            recovered_partial = True
+        m = re.search(r'"person_presence"\s*:\s*"([A-Z_]+)', txt, flags=re.I)
+        if m:
+            out["person_presence"] = m.group(1).strip().upper()
+            recovered_partial = True
+        m = re.search(r'"confidence"\s*:\s*"([A-Z]+)', txt, flags=re.I)
+        if m:
+            out["confidence"] = m.group(1).strip().upper()
+            recovered_partial = True
+        m = re.search(r"PREDICTION\s*:\s*([A-Z]+)", txt, flags=re.I)
+        if m:
+            out["prediction"] = m.group(1).strip().upper()
+        m = re.search(r"CONFIDENCE\s*:\s*([A-Z]+)", txt, flags=re.I)
+        if m:
+            out["confidence"] = m.group(1).strip().upper()
+        m = re.search(r"PRESENCE\s*:\s*([A-Z_]+)", txt, flags=re.I)
+        if m:
+            out["presence"] = m.group(1).strip().upper()
+        m = re.search(r"PERSON_PRESENCE\s*:\s*([A-Z_]+)", txt, flags=re.I)
+        if m:
+            out["person_presence"] = m.group(1).strip().upper()
+        m = re.search(r"RATIONALE\s*:\s*(.+)", txt, flags=re.I)
+        if m:
+            out["rationale"] = m.group(1).strip()
+    pred = str(out.get("prediction") or "").strip().upper()
+    if pred not in {"YES", "NO"}:
+        pred = None
+    out["prediction"] = pred
+    pres = str(out.get("presence") or "").strip().upper()
+    if pres not in {"PRESENT", "NOT_PRESENT", "UNCLEAR"}:
+        pres = None
+    out["presence"] = pres
+    person_pres = str(out.get("person_presence") or "").strip().upper()
+    if person_pres not in {"PRESENT", "NOT_PRESENT", "UNCLEAR"}:
+        person_pres = None
+    out["person_presence"] = person_pres
+    conf = str(out.get("confidence") or "LOW").strip().upper()
+    if conf not in {"LOW", "MEDIUM", "HIGH"}:
+        conf = "LOW"
+    out["confidence"] = conf
+    if out.get("rationale"):
+        out["rationale"] = str(out["rationale"]).strip()
+    else:
+        out["rationale"] = None
+    if isinstance(obj, dict):
+        out["parse_ok"] = bool(out["prediction"]) and bool(out["presence"]) and bool(out["person_presence"])
+        out["parse_status"] = "ok"
+        out["parse_partial"] = False
+        out["parse_reason"] = "json_object" if out["parse_ok"] else "json_missing_required_fields"
+    elif not txt:
+        out["parse_ok"] = False
+        out["parse_status"] = "empty"
+        out["parse_partial"] = False
+        out["parse_reason"] = "empty_text"
+    elif recovered_partial:
+        out["parse_ok"] = bool(out["prediction"]) and bool(out["presence"]) and bool(out["person_presence"])
+        out["parse_status"] = "partial_recovered"
+        out["parse_partial"] = True
+        out["parse_reason"] = "partial_json_fields"
+    else:
+        out["parse_ok"] = bool(out["prediction"]) and bool(out["presence"]) and bool(out["person_presence"])
+        out["parse_status"] = "invalid"
+        out["parse_partial"] = False
+        out["parse_reason"] = "non_json_fallback"
+    return out
+
+
+def _run_task4_gemini_visibility_verifier(image_pil, answer_yesno, obj_phrase, person_desc, query_cam, scene_type=None):
+    prompt = prompts.prompt_task4_gemini_visibility_verify(
+        answer_yesno=answer_yesno,
+        obj_phrase=obj_phrase,
+        person_desc=person_desc,
+        query_cam=query_cam,
+        scene_type=scene_type,
+    )
+    model = str(getattr(st, "TASK4_GEMINI_VERIFIER_MODEL", "")).strip() or None
+    cfg = {
+        "temperature": float(getattr(st, "TASK4_GEMINI_VERIFIER_TEMPERATURE", 0.2)),
+        "thinking_level": str(getattr(st, "TASK4_GEMINI_VERIFIER_THINKING_LEVEL", "low")).strip().lower(),
+        "thinking_budget": int(getattr(st, "TASK4_GEMINI_VERIFIER_THINKING_BUDGET", 32)),
+        "media_resolution": str(getattr(st, "TASK4_GEMINI_VERIFIER_MEDIA_RESOLUTION", "high")).strip().lower(),
+        "structured_json": bool(getattr(st, "TASK4_GEMINI_VERIFIER_STRUCTURED_JSON", True)),
+        "json_schema": {
+            "type": "OBJECT",
+            "properties": {
+                "prediction": {"type": "STRING", "enum": ["YES", "NO"]},
+                "presence": {"type": "STRING", "enum": ["PRESENT", "NOT_PRESENT", "UNCLEAR"]},
+                "person_presence": {"type": "STRING", "enum": ["PRESENT", "NOT_PRESENT", "UNCLEAR"]},
+                "confidence": {"type": "STRING", "enum": ["HIGH", "MEDIUM", "LOW"]},
+                "rationale": {"type": "STRING"},
+            },
+            "required": ["prediction", "presence", "person_presence", "confidence", "rationale"],
+        },
+        "retry_on_partial_json": bool(getattr(st, "TASK4_GEMINI_VERIFIER_RETRY_ON_PARTIAL_JSON", True)),
+        "retry_token_multiplier": float(getattr(st, "TASK4_GEMINI_VERIFIER_RETRY_TOKEN_MULTIPLIER", 2.0)),
+    }
+    resp = vlm_generate(
+        [image_pil],
+        prompt,
+        max_new_tokens=int(getattr(st, "TASK4_GEMINI_VERIFIER_MAX_NEW_TOKENS", 192)),
+        provider="gemini",
+        model_id=model,
+        generation_cfg=cfg,
+        return_meta=True,
+    )
+    if isinstance(resp, dict):
+        raw = str(resp.get("text") or "")
+        model_used = str(resp.get("model_used") or (model or "provider_default"))
+        model_requested = str(resp.get("model_requested") or (model or "provider_default"))
+        api_version_used = str(resp.get("api_version_used") or "")
+        mode_used = str(resp.get("mode_used") or "default")
+        sig_count = int(resp.get("thought_signature_count") or 0)
+        finish_reason = str(resp.get("finish_reason") or "")
+        retry_count = int(resp.get("retry_count") or 0)
+        token_budget_used = int(resp.get("token_budget_used") or 0)
+        schema_enabled = bool(resp.get("schema_enabled"))
+        parse_health = resp.get("parse_health")
+    else:
+        raw = str(resp or "")
+        model_used = model or "provider_default"
+        model_requested = model or "provider_default"
+        api_version_used = ""
+        mode_used = "default"
+        sig_count = 0
+        finish_reason = ""
+        retry_count = 0
+        token_budget_used = 0
+        schema_enabled = False
+        parse_health = None
+    out = _task4_parse_gemini_visibility_output(raw)
+    out["provider"] = "gemini"
+    out["model"] = model_used
+    out["model_requested"] = model_requested
+    out["images_used"] = 1
+    out["gemini_api_version"] = api_version_used
+    out["gemini_mode"] = mode_used
+    out["gemini_thought_signature_count"] = sig_count
+    out["finish_reason"] = finish_reason
+    out["retry_count"] = retry_count
+    out["token_budget_used"] = token_budget_used
+    out["schema_enabled"] = schema_enabled
+    out["parse_health"] = parse_health
+    return out
 
 
 def _reasoning_has_cues(text):
@@ -746,6 +941,198 @@ def build_task4_accessibility_grounded_to_task1(
 
     use_imgs = [by_cam[query_cam]]
     used_cams = [query_cam]
+    gemini_verifier = {
+        "enabled": bool(getattr(st, "TASK4_GEMINI_VERIFIER", True)),
+        "prediction": None,
+        "presence": None,
+        "person_presence": None,
+        "confidence": None,
+        "action": "keep",
+        "rationale": None,
+        "parse_ok": False,
+        "parse_status": None,
+        "parse_reason": None,
+        "parse_partial": False,
+    }
+    if gemini_verifier["enabled"] and (not st.ARGS.skip_vlm):
+        try:
+            vrec = _run_task4_gemini_visibility_verifier(
+                image_pil=use_imgs[0],
+                answer_yesno=answer,
+                obj_phrase=obj_phrase,
+                person_desc=person_desc,
+                query_cam=query_cam,
+                scene_type=split,
+            )
+        except Exception as e:
+            st.logger.warning(f"[Task4] Gemini visibility verifier failed; rejecting sample: {e}")
+            vrec = {
+                "prediction": None,
+                "presence": None,
+                "person_presence": None,
+                "confidence": "LOW",
+                "rationale": None,
+                "raw": "",
+                "provider": "gemini",
+                "model": "error",
+                "model_requested": str(getattr(st, "TASK4_GEMINI_VERIFIER_MODEL", "")).strip() or "provider_default",
+                "parse_ok": False,
+                "parse_status": "request_error",
+                "parse_partial": False,
+                "parse_reason": str(e),
+            }
+        gemini_verifier.update({
+            "prediction": vrec.get("prediction"),
+            "presence": vrec.get("presence"),
+            "person_presence": vrec.get("person_presence"),
+            "confidence": vrec.get("confidence"),
+            "rationale": vrec.get("rationale"),
+            "raw": vrec.get("raw"),
+            "provider": vrec.get("provider"),
+            "model": vrec.get("model"),
+            "model_requested": vrec.get("model_requested"),
+            "gemini_api_version": vrec.get("gemini_api_version"),
+            "gemini_mode": vrec.get("gemini_mode"),
+            "gemini_thought_signature_count": vrec.get("gemini_thought_signature_count"),
+            "finish_reason": vrec.get("finish_reason"),
+            "retry_count": vrec.get("retry_count"),
+            "token_budget_used": vrec.get("token_budget_used"),
+            "schema_enabled": vrec.get("schema_enabled"),
+            "parse_health": vrec.get("parse_health"),
+            "parse_ok": bool(vrec.get("parse_ok")),
+            "parse_status": vrec.get("parse_status"),
+            "parse_reason": vrec.get("parse_reason"),
+            "parse_partial": bool(vrec.get("parse_partial")),
+        })
+        gpred = str(vrec.get("prediction") or "").upper()
+        gpresence = str(vrec.get("presence") or "").upper()
+        gperson_presence = str(vrec.get("person_presence") or "").upper()
+        gconf = str(vrec.get("confidence") or "LOW").upper()
+        min_flip_conf = str(getattr(st, "TASK4_GEMINI_VERIFIER_MIN_FLIP_CONF", "HIGH")).upper()
+        reject_on_uncertain = bool(getattr(st, "TASK4_GEMINI_VERIFIER_REJECT_ON_UNCERTAIN_CONFLICT", True))
+        if (not bool(vrec.get("parse_ok"))) or gpred not in {"YES", "NO"} or gpresence not in {"PRESENT", "NOT_PRESENT", "UNCLEAR"} or gperson_presence not in {"PRESENT", "NOT_PRESENT", "UNCLEAR"}:
+            gemini_verifier["action"] = "reject"
+            st.REJECT_STATS["t4_gemini_verify_reject"] += 1
+            st.REJECT_STATS["t4_gemini_verifier_parse_fail"] += 1
+            st.REJECT_STATS["t4_verifier_fail"] += 1
+            log_debug({
+                "task": 4,
+                "split": split,
+                "seq": seq,
+                "frame_id": frame_id,
+                "person_desc": person_desc,
+                "anchor_cam": anchor_cam,
+                "gaze_target": gaze_target,
+                "query_cam": query_cam,
+                "visibility_gt": v,
+                "queried_object": obj_phrase,
+                "answer": answer,
+                "fail_reason": "task4_gemini_verifier_parse_fail",
+                "task4_gemini_verifier": gemini_verifier,
+            })
+            return None
+
+        if gperson_presence == "NOT_PRESENT":
+            gemini_verifier["action"] = "reject_person_not_present"
+            st.REJECT_STATS["t4_gemini_verify_reject"] += 1
+            st.REJECT_STATS["t4_gemini_verifier_person_not_present"] += 1
+            st.REJECT_STATS["t4_verifier_fail"] += 1
+            log_debug({
+                "task": 4,
+                "split": split,
+                "seq": seq,
+                "frame_id": frame_id,
+                "person_desc": person_desc,
+                "anchor_cam": anchor_cam,
+                "gaze_target": gaze_target,
+                "query_cam": query_cam,
+                "visibility_gt": v,
+                "queried_object": obj_phrase,
+                "answer": answer,
+                "fail_reason": "task4_gemini_verifier_person_not_present",
+                "task4_gemini_verifier": gemini_verifier,
+            })
+            return None
+
+        if gpresence == "NOT_PRESENT" and answer == "YES":
+            st.REJECT_STATS["t4_gemini_verifier_presence_conflict"] += 1
+            if _task4_conf_rank(gconf) >= _task4_conf_rank(min_flip_conf):
+                answer = "NO"
+                v = False
+                gemini_verifier["action"] = "flip_presence_not_present"
+                st.REJECT_STATS["t4_gemini_verify_flip"] += 1
+            elif reject_on_uncertain:
+                gemini_verifier["action"] = "reject"
+                st.REJECT_STATS["t4_gemini_verify_reject"] += 1
+                st.REJECT_STATS["t4_verifier_fail"] += 1
+                log_debug({
+                    "task": 4,
+                    "split": split,
+                    "seq": seq,
+                    "frame_id": frame_id,
+                    "person_desc": person_desc,
+                    "anchor_cam": anchor_cam,
+                    "gaze_target": gaze_target,
+                    "query_cam": query_cam,
+                    "visibility_gt": v,
+                    "queried_object": obj_phrase,
+                    "answer": answer,
+                    "fail_reason": "task4_gemini_verifier_presence_conflict",
+                    "task4_gemini_verifier": gemini_verifier,
+                })
+                return None
+
+        if gpresence == "NOT_PRESENT" and gpred == "YES":
+            st.REJECT_STATS["t4_gemini_verifier_presence_conflict"] += 1
+            gemini_verifier["action"] = "reject"
+            st.REJECT_STATS["t4_gemini_verify_reject"] += 1
+            st.REJECT_STATS["t4_verifier_fail"] += 1
+            log_debug({
+                "task": 4,
+                "split": split,
+                "seq": seq,
+                "frame_id": frame_id,
+                "person_desc": person_desc,
+                "anchor_cam": anchor_cam,
+                "gaze_target": gaze_target,
+                "query_cam": query_cam,
+                "visibility_gt": v,
+                "queried_object": obj_phrase,
+                "answer": answer,
+                "fail_reason": "task4_gemini_verifier_presence_prediction_conflict",
+                "task4_gemini_verifier": gemini_verifier,
+            })
+            return None
+
+        if gpred in {"YES", "NO"} and gpred != answer:
+            min_flip_conf = str(getattr(st, "TASK4_GEMINI_VERIFIER_MIN_FLIP_CONF", "HIGH")).upper()
+            if _task4_conf_rank(gconf) >= _task4_conf_rank(min_flip_conf):
+                answer = gpred
+                v = True if answer == "YES" else False
+                gemini_verifier["action"] = "flip"
+                st.REJECT_STATS["t4_gemini_verify_flip"] += 1
+            elif reject_on_uncertain:
+                gemini_verifier["action"] = "reject"
+                st.REJECT_STATS["t4_gemini_verify_reject"] += 1
+                st.REJECT_STATS["t4_verifier_fail"] += 1
+                log_debug({
+                    "task": 4,
+                    "split": split,
+                    "seq": seq,
+                    "frame_id": frame_id,
+                    "person_desc": person_desc,
+                    "anchor_cam": anchor_cam,
+                    "gaze_target": gaze_target,
+                    "query_cam": query_cam,
+                    "visibility_gt": v,
+                    "queried_object": obj_phrase,
+                    "answer": answer,
+                    "fail_reason": "task4_gemini_verifier_uncertain_conflict",
+                    "task4_gemini_verifier": gemini_verifier,
+                })
+                return None
+            else:
+                gemini_verifier["action"] = "keep"
 
     question = prompts.prompt_task4_question(query_cam, obj_phrase, person_desc, scene_type=split)
 
@@ -788,6 +1175,7 @@ def build_task4_accessibility_grounded_to_task1(
                 "answer": answer,
                 "reasoning": verify_reason,
                 "verification": judge_raw,
+                "task4_gemini_verifier": gemini_verifier,
                 "fail_reason": "verifier_fail",
             })
             return None
@@ -843,6 +1231,7 @@ def build_task4_accessibility_grounded_to_task1(
                 "answer": answer,
                 "reasoning": reasoning,
                 "verification": judge_raw,
+                "task4_gemini_verifier": gemini_verifier,
                 "fail_reason": "verifier_fail",
             })
             return None
@@ -874,7 +1263,8 @@ def build_task4_accessibility_grounded_to_task1(
             "queried_object": obj_phrase,
             "answer": answer,
             "reasoning": reasoning,
-            "verification": judge_raw
+            "verification": judge_raw,
+            "task4_gemini_verifier": gemini_verifier,
         })
 
     verified = bool(st.TASK4_REQUIRE_VERIFIER_PASS) and (not st.TASK4_USE_GAZE_TARGET or st.REASONING_MODE != "gt")
@@ -905,7 +1295,8 @@ def build_task4_accessibility_grounded_to_task1(
             "visibility_gt": v,
             "visibility_source": visibility_source,
             "queried_object_source": obj_source,
-            "verified_reasoning": verified
+            "verified_reasoning": verified,
+            "task4_gemini_verifier": gemini_verifier,
         },
         "input_cams": used_cams,
         "input_images": [{"cam": query_cam, "image": by_cam[query_cam]}],

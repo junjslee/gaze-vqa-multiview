@@ -8,3 +8,5 @@ workflow_diagrams.md
 .env
 .env.*
 !.env.example
+.sbatch
+/draft_of_evaluation

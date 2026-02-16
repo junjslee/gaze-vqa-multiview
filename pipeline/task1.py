@@ -1,4 +1,5 @@
 # task1.py
+import json
 import re
 import random
 import traceback
@@ -13,6 +14,7 @@ from .sam2_utils import (
     segment_object_at_gaze,
     segment_object_on_crop,
     overlay_mask_on_image,
+    overlay_mask_on_image_neutral,
     draw_dot_on_crop,
     mask_person_overlap_ratio,
 )
@@ -130,7 +132,12 @@ def build_ray_label_prompt_image(raw_img_pil, anno_scaled, body_bbox_xywh=None, 
     cue = raw_img_pil.copy()
     if target_mask_u8 is not None:
         try:
-            cue = overlay_mask_on_image(cue, (target_mask_u8 > 0).astype(np.uint8), alpha=0.45)
+            # Neutral dim overlay to avoid injecting red hue into object appearance.
+            cue = overlay_mask_on_image_neutral(
+                cue,
+                (target_mask_u8 > 0).astype(np.uint8),
+                dim_outside=0.55,
+            )
         except Exception:
             pass
     cue = _draw_person_bbox_overlay(cue, body_bbox_xywh, color=(0, 255, 255), width=3)
@@ -485,13 +492,389 @@ def _conf_rank(conf):
     return {"LOW": 0, "MEDIUM": 1, "HIGH": 2}.get(str(conf or "LOW").upper(), 0)
 
 
+def _extract_json_obj(raw):
+    txt = (raw or "").strip()
+    if not txt:
+        return None
+    if txt.startswith("```"):
+        txt = re.sub(r"^```(?:json)?\s*", "", txt, flags=re.I)
+        txt = re.sub(r"\s*```$", "", txt)
+        txt = txt.strip()
+    try:
+        obj = json.loads(txt)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", txt, flags=re.S)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        return None
+    return None
+
+
+def _extract_partial_json_value(txt, keys):
+    s = str(txt or "")
+    for key in keys:
+        # Accept both fully closed and truncated string values.
+        m = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"\n\r}}]*)', s, flags=re.I)
+        if m:
+            v = m.group(1).strip()
+            if v:
+                return v
+    return None
+
+
+def _task1_teacher_scene_setting(scene_setting):
+    ss = str(scene_setting or "").strip().upper()
+    if ss not in {"COMMON_AREA", "OFFICE", "STORAGE_AREA", "KITCHEN", "LAB", "SHOP", "OTHER", "UNCLEAR"}:
+        ss = "UNCLEAR"
+    return ss
+
+
+def _parse_task1_teacher_output_json(raw):
+    txt = (raw or "").strip()
+    out = {
+        "final_label": None,
+        "qwen_verdict": "UNCLEAR",
+        "confidence": "LOW",
+        "scene_setting": "UNCLEAR",
+        "target_local_context": None,
+        "rationale": None,
+        "parse_ok": False,
+        "parse_status": "invalid",
+        "parse_partial": False,
+        "parse_reason": None,
+        "raw": txt,
+    }
+    obj = _extract_json_obj(txt)
+    recovered_partial = False
+    if isinstance(obj, dict):
+        out["final_label"] = obj.get("final_label") or obj.get("label")
+        out["qwen_verdict"] = obj.get("qwen_verdict") or obj.get("verdict") or out["qwen_verdict"]
+        out["confidence"] = obj.get("confidence") or out["confidence"]
+        out["scene_setting"] = obj.get("scene_setting") or out["scene_setting"]
+        out["target_local_context"] = obj.get("target_local_context")
+        out["rationale"] = obj.get("rationale")
+    else:
+        # Recover fields from partial/truncated JSON fragments first.
+        pl = _extract_partial_json_value(txt, ["final_label", "label"])
+        if pl:
+            out["final_label"] = pl
+            recovered_partial = True
+        pv = _extract_partial_json_value(txt, ["qwen_verdict", "verdict"])
+        if pv:
+            out["qwen_verdict"] = pv
+            recovered_partial = True
+        pc = _extract_partial_json_value(txt, ["confidence"])
+        if pc:
+            out["confidence"] = pc
+            recovered_partial = True
+        m = re.search(r"FINAL_LABEL\s*:\s*(.+)", txt, flags=re.I)
+        if m:
+            out["final_label"] = m.group(1).strip()
+        m = re.search(r"QWEN_VERDICT\s*:\s*([A-Z_]+)", txt, flags=re.I)
+        if m:
+            out["qwen_verdict"] = m.group(1).strip().upper()
+        m = re.search(r"CONFIDENCE\s*:\s*([A-Z]+)", txt, flags=re.I)
+        if m:
+            out["confidence"] = m.group(1).strip().upper()
+        m = re.search(r"SCENE_SETTING\s*:\s*([A-Z_]+)", txt, flags=re.I)
+        if m:
+            out["scene_setting"] = m.group(1).strip().upper()
+        m = re.search(r"TARGET_LOCAL_CONTEXT\s*:\s*(.+)", txt, flags=re.I)
+        if m:
+            out["target_local_context"] = _first_two_sentences(m.group(1).strip())
+        m = re.search(r"RATIONALE\s*:\s*(.+)", txt, flags=re.I)
+        if m:
+            out["rationale"] = _first_two_sentences(m.group(1).strip())
+
+    if not out["final_label"]:
+        out["final_label"] = strict_noun_phrase(txt, max_words=4)
+    if not out["final_label"]:
+        out["final_label"] = clean_label(txt, max_words=4)
+    out["final_label"] = _sanitize_label(_filter_object_phrase(out["final_label"]))
+    if out["final_label"] and _is_generic_label(out["final_label"]):
+        out["final_label"] = None
+
+    qv = str(out.get("qwen_verdict") or "UNCLEAR").strip().upper()
+    if qv not in {"CORRECT", "INCORRECT", "UNCLEAR"}:
+        qv = "UNCLEAR"
+    out["qwen_verdict"] = qv
+
+    conf = str(out.get("confidence") or "LOW").strip().upper()
+    if conf not in {"LOW", "MEDIUM", "HIGH"}:
+        conf = "LOW"
+    out["confidence"] = conf
+
+    out["scene_setting"] = _task1_teacher_scene_setting(out.get("scene_setting"))
+    if out.get("target_local_context"):
+        out["target_local_context"] = _first_two_sentences(str(out["target_local_context"]).strip())
+    else:
+        out["target_local_context"] = None
+    if out.get("rationale"):
+        out["rationale"] = _first_two_sentences(str(out["rationale"]).strip())
+    else:
+        out["rationale"] = None
+    if isinstance(obj, dict):
+        out["parse_status"] = "ok"
+        out["parse_ok"] = bool(out["final_label"])
+        out["parse_partial"] = False
+        out["parse_reason"] = "json_object" if out["final_label"] else "json_missing_label"
+    elif not txt:
+        out["parse_status"] = "empty"
+        out["parse_ok"] = False
+        out["parse_partial"] = False
+        out["parse_reason"] = "empty_text"
+    elif recovered_partial:
+        out["parse_status"] = "partial_recovered"
+        out["parse_ok"] = bool(out["final_label"])
+        out["parse_partial"] = True
+        out["parse_reason"] = "partial_json_fields"
+    else:
+        out["parse_status"] = "invalid"
+        out["parse_ok"] = bool(out["final_label"])
+        out["parse_partial"] = False
+        out["parse_reason"] = "non_json_fallback"
+    return out
+
+
+def _task1_label_root(label):
+    s = _sanitize_label(label)
+    if not s:
+        return None
+    return _sanitize_label(s.split(" on ", 1)[0].strip())
+
+
+def _task1_semantic_equivalent(label_a, label_b):
+    if _labels_relaxed_match(label_a, label_b):
+        return True
+    ra = _task1_label_root(label_a)
+    rb = _task1_label_root(label_b)
+    if not ra or not rb:
+        return False
+    if _labels_relaxed_match(ra, rb):
+        return True
+    alias = {
+        "couch": "sofa",
+        "sofa": "sofa",
+        "desk": "table",
+        "table": "table",
+        "cupboard": "cabinet",
+        "cabinet": "cabinet",
+    }
+    ta = [alias.get(t, t) for t in ra.split()]
+    tb = [alias.get(t, t) for t in rb.split()]
+    sa = set(ta)
+    sb = set(tb)
+    if not sa or not sb:
+        return False
+    return sa.issubset(sb) or sb.issubset(sa)
+
+
+def _task1_teacher_gen_cfg():
+    cfg = {
+        "temperature": float(getattr(st, "TASK1_TEACHER_TEMPERATURE", 0.2)),
+    }
+    if str(getattr(st, "TASK1_TEACHER_PROVIDER", "")).strip().lower() == "gemini":
+        cfg.update({
+            "thinking_level": str(getattr(st, "TASK1_TEACHER_GEMINI_THINKING_LEVEL", "medium")).strip().lower(),
+            "thinking_budget": int(getattr(st, "TASK1_TEACHER_GEMINI_THINKING_BUDGET", 64)),
+            "media_resolution": str(getattr(st, "TASK1_TEACHER_GEMINI_MEDIA_RESOLUTION", "high")).strip().lower(),
+            "structured_json": bool(getattr(st, "TASK1_TEACHER_STRUCTURED_JSON", True)),
+            "json_schema": {
+                "type": "OBJECT",
+                "properties": {
+                    "final_label": {"type": "STRING"},
+                    "qwen_verdict": {"type": "STRING", "enum": ["CORRECT", "INCORRECT", "UNCLEAR"]},
+                    "confidence": {"type": "STRING", "enum": ["HIGH", "MEDIUM", "LOW"]},
+                },
+                "required": ["final_label", "qwen_verdict", "confidence"],
+            },
+            "retry_on_partial_json": bool(getattr(st, "TASK1_TEACHER_RETRY_ON_PARTIAL_JSON", True)),
+            "retry_token_multiplier": float(getattr(st, "TASK1_TEACHER_RETRY_TOKEN_MULTIPLIER", 2.0)),
+        })
+    return cfg
+
+
+def _run_task1_teacher_pass1(
+    person_desc,
+    anchor_cam,
+    scene_type,
+    ray_context_pil,
+    student_label,
+    candidate_labels,
+    mask_area_ratio=None,
+):
+    prompt = prompts.prompt_task1_teacher_pass1(
+        person_desc=person_desc,
+        anchor_cam=anchor_cam,
+        student_label=student_label,
+        candidate_labels=candidate_labels,
+        scene_type=scene_type,
+        mask_area_ratio=mask_area_ratio,
+    )
+    imgs = [ray_context_pil] if ray_context_pil is not None else []
+    provider = str(getattr(st, "TASK1_TEACHER_PROVIDER", "gemini")).strip().lower()
+    model = str(getattr(st, "TASK1_TEACHER_MODEL", "")).strip() or None
+    resp = vlm_generate(
+        imgs,
+        prompt,
+        max_new_tokens=int(getattr(st, "TASK1_TEACHER_MAX_NEW_TOKENS", 512)),
+        provider=provider,
+        model_id=model,
+        generation_cfg=_task1_teacher_gen_cfg(),
+        return_meta=True,
+    )
+    if isinstance(resp, dict):
+        raw = str(resp.get("text") or "")
+        model_used = str(resp.get("model_used") or (model or "provider_default"))
+        api_version_used = str(resp.get("api_version_used") or "")
+        mode_used = str(resp.get("mode_used") or "default")
+        sig_count = int(resp.get("thought_signature_count") or 0)
+        history_turn = resp.get("history_turn")
+        model_requested = str(resp.get("model_requested") or (model or "provider_default"))
+        finish_reason = str(resp.get("finish_reason") or "")
+        retry_count = int(resp.get("retry_count") or 0)
+        token_budget_used = int(resp.get("token_budget_used") or 0)
+        schema_enabled = bool(resp.get("schema_enabled"))
+        parse_health = resp.get("parse_health")
+    else:
+        raw = str(resp or "")
+        model_used = model or "provider_default"
+        api_version_used = ""
+        mode_used = "default"
+        sig_count = 0
+        history_turn = None
+        model_requested = model or "provider_default"
+        finish_reason = ""
+        retry_count = 0
+        token_budget_used = 0
+        schema_enabled = False
+        parse_health = None
+    out = _parse_task1_teacher_output_json(raw)
+    out["provider"] = provider
+    out["model"] = model_used
+    out["model_requested"] = model_requested
+    out["images_used"] = len(imgs)
+    out["finish_reason"] = finish_reason
+    out["retry_count"] = retry_count
+    out["token_budget_used"] = token_budget_used
+    out["schema_enabled"] = schema_enabled
+    out["parse_health"] = parse_health
+    if provider == "gemini":
+        out["gemini_api_version"] = api_version_used
+        out["gemini_mode"] = mode_used
+        out["gemini_thought_signature_count"] = sig_count
+        if isinstance(history_turn, list) and history_turn:
+            out["_gemini_history_turn"] = history_turn
+    return out
+
+
+def _run_task1_teacher_pass2_conflict(
+    person_desc,
+    anchor_cam,
+    scene_type,
+    ray_context_pil,
+    student_label,
+    teacher_label_pass1,
+    candidate_labels,
+    prior_history_turn=None,
+):
+    prompt = prompts.prompt_task1_teacher_pass2_conflict(
+        person_desc=person_desc,
+        anchor_cam=anchor_cam,
+        student_label=student_label,
+        teacher_label_pass1=teacher_label_pass1,
+        candidate_labels=candidate_labels,
+        scene_type=scene_type,
+    )
+    imgs = [ray_context_pil] if ray_context_pil is not None else []
+    provider = str(getattr(st, "TASK1_TEACHER_PROVIDER", "gemini")).strip().lower()
+    model = str(getattr(st, "TASK1_TEACHER_MODEL", "")).strip() or None
+    gen_cfg = _task1_teacher_gen_cfg()
+    if provider == "gemini" and isinstance(prior_history_turn, list) and prior_history_turn:
+        gen_cfg = dict(gen_cfg)
+        gen_cfg["history_contents"] = prior_history_turn
+    resp = vlm_generate(
+        imgs,
+        prompt,
+        max_new_tokens=int(getattr(st, "TASK1_TEACHER_MAX_NEW_TOKENS", 512)),
+        provider=provider,
+        model_id=model,
+        generation_cfg=gen_cfg,
+        return_meta=True,
+    )
+    if isinstance(resp, dict):
+        raw = str(resp.get("text") or "")
+        model_used = str(resp.get("model_used") or (model or "provider_default"))
+        api_version_used = str(resp.get("api_version_used") or "")
+        mode_used = str(resp.get("mode_used") or "default")
+        sig_count = int(resp.get("thought_signature_count") or 0)
+        model_requested = str(resp.get("model_requested") or (model or "provider_default"))
+        finish_reason = str(resp.get("finish_reason") or "")
+        retry_count = int(resp.get("retry_count") or 0)
+        token_budget_used = int(resp.get("token_budget_used") or 0)
+        schema_enabled = bool(resp.get("schema_enabled"))
+        parse_health = resp.get("parse_health")
+    else:
+        raw = str(resp or "")
+        model_used = model or "provider_default"
+        api_version_used = ""
+        mode_used = "default"
+        sig_count = 0
+        model_requested = model or "provider_default"
+        finish_reason = ""
+        retry_count = 0
+        token_budget_used = 0
+        schema_enabled = False
+        parse_health = None
+    out = _parse_task1_teacher_output_json(raw)
+    out["provider"] = provider
+    out["model"] = model_used
+    out["model_requested"] = model_requested
+    out["images_used"] = len(imgs)
+    out["finish_reason"] = finish_reason
+    out["retry_count"] = retry_count
+    out["token_budget_used"] = token_budget_used
+    out["schema_enabled"] = schema_enabled
+    out["parse_health"] = parse_health
+    if provider == "gemini":
+        out["gemini_api_version"] = api_version_used
+        out["gemini_mode"] = mode_used
+        out["gemini_thought_signature_count"] = sig_count
+    return out
+
+
+def _task1_should_run_teacher_second_call(student_label, teacher_label):
+    if not bool(getattr(st, "TASK1_TEACHER_SECOND_CALL_ON_MISMATCH", True)):
+        return False
+    if not student_label or not teacher_label:
+        return False
+    return not _task1_semantic_equivalent(student_label, teacher_label)
+
+
+def _task1_teacher_label_valid(label, confidence):
+    lab = _sanitize_label(label)
+    if not lab or _is_generic_label(lab):
+        return False
+    conf = str(confidence or "LOW").upper()
+    min_conf = str(getattr(st, "TASK1_TEACHER_MIN_CONF", "MEDIUM")).upper()
+    return _conf_rank(conf) >= _conf_rank(min_conf)
+
+
 def _task1_should_run_hybrid_guardrail(current_label, label_map):
     cur = _sanitize_label(current_label)
     if _is_ambiguous_label(cur):
         return True, "current_ambiguous"
     if _task1_has_semantic_disagreement(label_map):
         return True, "cue_disagreement"
-    return False, "no_trigger"
+    return True, "always_on"
 
 
 def _parse_task1_hybrid_guardrail_output(raw):
@@ -500,6 +883,8 @@ def _parse_task1_hybrid_guardrail_output(raw):
         "final_label": None,
         "decision": "UNSURE",
         "confidence": "LOW",
+        "scene_setting": "UNCLEAR",
+        "target_local_context": None,
         "scene_fit_current": "UNCLEAR",
         "scene_fit_proposed": "UNCLEAR",
         "rationale": None,
@@ -515,6 +900,12 @@ def _parse_task1_hybrid_guardrail_output(raw):
         m = re.search(r"CONFIDENCE\s*:\s*([A-Z]+)", txt, flags=re.I)
         if m:
             out["confidence"] = m.group(1).strip().upper()
+        m = re.search(r"SCENE_SETTING\s*:\s*([A-Z_]+)", txt, flags=re.I)
+        if m:
+            out["scene_setting"] = m.group(1).strip().upper()
+        m = re.search(r"TARGET_LOCAL_CONTEXT\s*:\s*(.+)", txt, flags=re.I)
+        if m:
+            out["target_local_context"] = _first_two_sentences(m.group(1).strip())
         m = re.search(r"SCENE_FIT_CURRENT\s*:\s*([A-Z]+)", txt, flags=re.I)
         if m:
             out["scene_fit_current"] = m.group(1).strip().upper()
@@ -535,6 +926,12 @@ def _parse_task1_hybrid_guardrail_output(raw):
 
     if out["confidence"] not in {"LOW", "MEDIUM", "HIGH"}:
         out["confidence"] = "LOW"
+    if out["scene_setting"] not in {
+        "COMMON_AREA", "OFFICE", "STORAGE_AREA", "KITCHEN", "LAB", "SHOP", "OTHER", "UNCLEAR"
+    }:
+        out["scene_setting"] = "UNCLEAR"
+    if not str(out.get("target_local_context") or "").strip():
+        out["target_local_context"] = None
     if out["scene_fit_current"] not in {"YES", "NO", "UNCLEAR"}:
         out["scene_fit_current"] = "UNCLEAR"
     if out["scene_fit_proposed"] not in {"YES", "NO", "UNCLEAR"}:
@@ -569,18 +966,27 @@ def _build_task1_hybrid_guardrail_prompt(
     return (
         "You are a strict gaze-target arbiter for dataset quality.\n"
         "Inputs are multi-cue candidates from mask, dot, ray, and multiview synthesis.\n"
+        "Do not confuse cue markers (arrow/ring/crosshair) with real objects; if the true object is a tomato, output tomato/red tomato.\n"
         "Interpret images in order:\n"
-        "1) mask crop 2) mask+dot crop 3) full cue-rich frame (person bbox + ray marker + mask) 4) full frame.\n"
+        "1) full frame with gaze-ray cue 2) full raw frame.\n"
         f"Target person: {who}. Anchor camera: {anchor_cam}. Scene: {scene_type}.\n"
         f"Current label: {cur_txt}\n"
         f"Mask area ratio: {mar_txt}\n"
         "Candidate labels:\n"
         f"{cand_block}\n"
         f"{scene_line}\n"
+        "First infer broad scene setting and local context near the gaze ray silently.\n"
+        "Then infer semantic plausibility silently.\n"
+        "Do NOT output internal chain-of-thought.\n"
+        "Use SCENE_SETTING from this set: COMMON_AREA, OFFICE, STORAGE_AREA, KITCHEN, LAB, SHOP, OTHER, UNCLEAR.\n"
+        "TARGET_LOCAL_CONTEXT should be a short phrase (3-8 words) describing nearby context around the gaze target.\n"
+        "Then choose FINAL_LABEL by combining visual cues and candidate consistency.\n"
         "Return ONLY these lines:\n"
         "FINAL_LABEL: <1-4 words>\n"
         "DECISION: <KEEP|SWITCH_MASK|SWITCH_DOT|SWITCH_RAY|SWITCH_MV|REFINE|UNSURE>\n"
         "CONFIDENCE: <HIGH|MEDIUM|LOW>\n"
+        "SCENE_SETTING: <COMMON_AREA|OFFICE|STORAGE_AREA|KITCHEN|LAB|SHOP|OTHER|UNCLEAR>\n"
+        "TARGET_LOCAL_CONTEXT: <3-8 words>\n"
         "SCENE_FIT_CURRENT: <YES|NO|UNCLEAR>\n"
         "SCENE_FIT_PROPOSED: <YES|NO|UNCLEAR>\n"
         "RATIONALE: <max 16 words>"
@@ -592,7 +998,7 @@ def _run_task1_hybrid_guardrail(
     anchor_cam,
     scene_type,
     anchor_resized,
-    ray_label_prompt_pil,
+    ray_context_pil,
     masked_crop,
     dot_mask_crop,
     current_label,
@@ -608,7 +1014,8 @@ def _run_task1_hybrid_guardrail(
         mask_area_ratio=mask_area_ratio,
         scene_check=bool(getattr(st, "TASK1_GUARDRAIL_SCENE_CHECK", True)),
     )
-    imgs = [masked_crop, dot_mask_crop, ray_label_prompt_pil, anchor_resized]
+    # Guardrail now only sees global scene context with gaze cue + raw frame.
+    imgs = [ray_context_pil, anchor_resized]
     imgs = [im for im in imgs if im is not None]
     guard_provider = str(getattr(st, "TASK1_GUARDRAIL_PROVIDER", "gemini")).strip().lower()
     guard_model = str(getattr(st, "TASK1_GUARDRAIL_MODEL", "")).strip() or None
@@ -668,6 +1075,9 @@ def _run_task1_qwen_guided_refine(
     ray_label_prompt_pil,
     masked_crop,
     dot_mask_crop,
+    guardrail_rationale=None,
+    guardrail_scene_setting=None,
+    guardrail_target_local_context=None,
 ):
     allow = []
     for v in (candidate_labels or {}).values():
@@ -686,6 +1096,17 @@ def _run_task1_qwen_guided_refine(
         "Prefer scene-consistent, concrete object identity and avoid generic terms.\n"
         f"Current label: {cur or 'none'}\n"
         f"Guardrail suggestion: {grd or 'none'}\n"
+    )
+    scene_setting = str(guardrail_scene_setting or "").strip().upper()
+    if scene_setting and scene_setting != "UNCLEAR":
+        prompt += f"Broad scene setting (from guardrail): {scene_setting}\n"
+    local_ctx = _first_two_sentences(guardrail_target_local_context or "")
+    if local_ctx:
+        prompt += f"Target local context (from guardrail): {local_ctx}\n"
+    hint = _first_two_sentences(guardrail_rationale or "")
+    if hint:
+        prompt += f"Scene hint from guardrail: {hint}\n"
+    prompt += (
         f"Allowed labels: {allow_txt}\n"
         "Output ONLY:\n"
         "FINAL_LABEL: <one label from Allowed labels>\n"
@@ -1062,6 +1483,25 @@ def canonicalize_triple_cue(ray_label, mask_label, dot_label, ray_desc=None, dot
     return (fallback, "fallback_no_consensus") if fallback else (None, "no_consensus")
 
 
+def _dot_tiebreak_allowed(mask_label, dot_label, ray_fallback=None):
+    dot = _sanitize_label(dot_label)
+    if not dot or _is_generic_label(dot) or _is_bleeding_label(dot):
+        return False
+    mask = _sanitize_label(mask_label)
+    mask_needs_help = (
+        (not mask)
+        or _is_generic_label(mask)
+        or _is_ambiguous_label(mask)
+        or _is_bleeding_label(mask)
+    )
+    if not mask_needs_help:
+        return False
+    ray = _sanitize_label(ray_fallback)
+    if not ray:
+        return False
+    return _labels_relaxed_match(dot, ray) or _labels_token_subset_match(dot, ray)
+
+
 def canonicalize_mask_overlay(mask_label, dot_label, mask_area_ratio=None, scene_type=None, ray_fallback=None):
     mask_label_for_canon = mask_label
     mask_small_skip = False
@@ -1084,42 +1524,94 @@ def canonicalize_mask_overlay(mask_label, dot_label, mask_area_ratio=None, scene
             mask_label_for_canon = None
             mask_small_skip = True
 
-    label, mode = canonicalize_triple_cue(
-        None, mask_label_for_canon, dot_label,
-        ray_desc=None, dot_desc=None, scene_type=scene_type
-    )
+    label = None
+    mode = None
+
+    # Mask-first policy: use mask cue when it is concrete enough.
+    if mask_label_for_canon and not (
+        _is_generic_label(mask_label_for_canon)
+        or _is_ambiguous_label(mask_label_for_canon)
+        or _is_bleeding_label(mask_label_for_canon)
+    ):
+        label = _sanitize_label(mask_label_for_canon)
+        mode = "mask_primary"
+
+    # Dot is tie-break only when mask is weak and dot agrees with ray context.
+    if (not label) and _dot_tiebreak_allowed(mask_label_for_canon, dot_label, ray_fallback=ray_fallback):
+        label = _sanitize_label(dot_label)
+        mode = "dot_tiebreak_ray"
+
     if mask_small_skip:
         mode = f"{mode}+mask_small_skip" if mode else "mask_small_skip"
+
     if not label and ray_fallback:
         label = ray_fallback
         mode = "fallback_ray_only"
+
     return label, mode, mask_small_skip
 
 
-def _camera_rank_weight(cam, anchor_cam, anchor_order):
-    rank_map = {c: i for i, c in enumerate(anchor_order or [])}
-    rank = rank_map.get(cam, len(rank_map))
-    base = 1.0 / (1.0 + 0.45 * float(rank))
-    if cam == anchor_cam:
-        base += 1.0
-    return float(base)
+def _camera_rank_weight(
+    cam,
+    anchor_cam,
+    anchor_order,
+    *,
+    closest_cam=None,
+    bbox_gaze_dist_norm=None,
+):
+    weight = 2.0 if cam == anchor_cam else 1.0
+    if closest_cam is None or cam != closest_cam:
+        return weight
+    try:
+        dist_norm = float(bbox_gaze_dist_norm)
+    except Exception:
+        return weight
+    if not math.isfinite(dist_norm):
+        return weight
+    close_thresh = float(getattr(st, "TASK1_MV_CLOSEST_DIST_NORM_THRESH", 0.20))
+    downscale = float(getattr(st, "TASK1_MV_CLOSEST_WEIGHT_DOWNSCALE", 0.75))
+    downscale = max(0.5, min(1.0, downscale))
+    if dist_norm <= close_thresh:
+        weight *= downscale
+    return weight
 
 
 def _synthesize_multiview_labels(mv_labels, scene_type=None, anchor_cam=None, anchor_order=None):
     """
     Weighted multiview synthesis:
     - Anchor camera gets strongest prior.
-    - Remaining cameras are weighted by anchor-rank order (descending confidence).
+    - Remaining cameras use equal weight.
+    - Closest bbox<->gaze view gets a small downweight when very close.
     """
     items = []
+    closest_cam = None
+    closest_dist_norm = None
     if isinstance(mv_labels, dict):
+        for cam, ent in mv_labels.items():
+            if not isinstance(ent, dict):
+                continue
+            try:
+                dist_norm = float(ent.get("bbox_gaze_dist_norm"))
+            except Exception:
+                continue
+            if not math.isfinite(dist_norm):
+                continue
+            if closest_dist_norm is None or dist_norm < closest_dist_norm:
+                closest_dist_norm = dist_norm
+                closest_cam = cam
         for cam, ent in mv_labels.items():
             if not isinstance(ent, dict):
                 continue
             lab = ent.get("label")
             if not lab:
                 continue
-            w = _camera_rank_weight(cam, anchor_cam, anchor_order)
+            w = _camera_rank_weight(
+                cam,
+                anchor_cam,
+                anchor_order,
+                closest_cam=closest_cam,
+                bbox_gaze_dist_norm=ent.get("bbox_gaze_dist_norm"),
+            )
             items.append((cam, lab, w))
     else:
         for i, lab in enumerate(mv_labels or []):
@@ -1332,6 +1824,19 @@ def _point_to_bbox_distance(point_xy, bbox_xywh):
     dx = max(x1 - px, 0.0, px - x2)
     dy = max(y1 - py, 0.0, py - y2)
     return math.hypot(dx, dy)
+
+
+def _point_to_bbox_distance_norm(point_xy, bbox_xywh):
+    dist_px = _point_to_bbox_distance(point_xy, bbox_xywh)
+    if dist_px is None or not bbox_xywh:
+        return None
+    try:
+        bw = float(bbox_xywh[2])
+        bh = float(bbox_xywh[3])
+    except Exception:
+        return None
+    diag = max(1.0, math.hypot(max(1.0, bw), max(1.0, bh)))
+    return float(dist_px / diag)
 
 
 def _anchor_cam_score(anno):
@@ -1571,8 +2076,32 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
             }
             hybrid_guardrail = {
                 "enabled": bool(getattr(st, "TASK1_HYBRID_GUARDRAIL", False)),
+                "mode": "guide_only",
                 "triggered": False,
                 "applied": False,
+                "applied_by": "none",
+                "proposed_label": None,
+                "proposed_passed_gate": False,
+                "blocked_reason": None,
+            }
+            teacher_mode = bool(getattr(st, "TASK1_TEACHER_FINAL", False)) and not bool(
+                getattr(st, "TASK1_LEGACY_PIPELINE", False)
+            )
+            teacher_final = {
+                "enabled": teacher_mode,
+                "triggered": False,
+                "applied": False,
+                "call_count": 0,
+                "student_label": None,
+                "teacher_label_pass1": None,
+                "teacher_label_pass2": None,
+                "semantic_match_qwen_teacher": None,
+                "qwen_verdict": "UNCLEAR",
+                "teacher_confidence": "LOW",
+                "final_source": "student_fallback",
+                "final_label": None,
+                "reason": None,
+                "rationale": None,
             }
 
             for seg_name, seg_cfg in _task1_segmentation_attempts():
@@ -1854,13 +2383,16 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                 if (
                     _is_loose_stage(seg_name)
                     and (not attempt_canonical_object or _is_ambiguous_label(attempt_canonical_object))
-                    and dot_label_for_canon
-                    and not _is_generic_label(dot_label_for_canon)
+                    and _dot_tiebreak_allowed(
+                        attempt_canonical_object,
+                        dot_label_for_canon,
+                        ray_fallback=phrase_from_ray,
+                    )
                 ):
-                    attempt_canonical_object = dot_label_for_canon
+                    attempt_canonical_object = _sanitize_label(dot_label_for_canon)
                     attempt_canon_mode = (
-                        f"{attempt_canon_mode}+loose_dot_mask_rescue"
-                        if attempt_canon_mode else "loose_dot_mask_rescue"
+                        f"{attempt_canon_mode}+dot_tiebreak_ray"
+                        if attempt_canon_mode else "dot_tiebreak_ray"
                     )
 
                 if (
@@ -2073,6 +2605,8 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
             mv_coords_scaled = {}
             anchor_label = canonical_object
             anchor_canon_mode = canon_mode
+            anchor_bbox_gaze_dist_px = _point_to_bbox_distance(coord_scaled, body_bbox_scaled)
+            anchor_bbox_gaze_dist_norm = _point_to_bbox_distance_norm(coord_scaled, body_bbox_scaled)
 
             if anchor_label:
                 mv_labels[anchor_cam] = {
@@ -2095,6 +2629,8 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                     "large_mask_refine_frac": large_mask_refine_frac,
                     "positional_label": positional_label,
                     "ray_available": ray_available,
+                    "bbox_gaze_dist_px": anchor_bbox_gaze_dist_px,
+                    "bbox_gaze_dist_norm": anchor_bbox_gaze_dist_norm,
                 }
                 mv_coords_scaled[anchor_cam] = [float(coord_scaled[0]), float(coord_scaled[1])]
 
@@ -2126,6 +2662,8 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
 
                 mv_body = get_body_bbox(anno_scaled)
                 mv_ray_available = _has_valid_body_bbox(mv_body)
+                mv_bbox_gaze_dist_px = _point_to_bbox_distance(coord_mv, mv_body)
+                mv_bbox_gaze_dist_norm = _point_to_bbox_distance_norm(coord_mv, mv_body)
                 mv_ray_label = None
                 mv_dot_label_full = None
                 mv_ray_desc = None
@@ -2301,13 +2839,16 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                     if (
                         _is_loose_stage(seg_name)
                         and (not mv_label_attempt or _is_ambiguous_label(mv_label_attempt))
-                        and mv_dot_for_canon
-                        and not _is_generic_label(mv_dot_for_canon)
+                        and _dot_tiebreak_allowed(
+                            mv_label_attempt,
+                            mv_dot_for_canon,
+                            ray_fallback=mv_ray_label,
+                        )
                     ):
-                        mv_label_attempt = mv_dot_for_canon
+                        mv_label_attempt = _sanitize_label(mv_dot_for_canon)
                         mv_mode_attempt = (
-                            f"{mv_mode_attempt}+loose_dot_mask_rescue"
-                            if mv_mode_attempt else "loose_dot_mask_rescue"
+                            f"{mv_mode_attempt}+dot_tiebreak_ray"
+                            if mv_mode_attempt else "dot_tiebreak_ray"
                         )
 
                     mv_positional_label = None
@@ -2423,6 +2964,8 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                         "large_mask_refine_frac": mv_large_refine_frac,
                         "positional_label": mv_positional_label,
                         "ray_available": mv_ray_available,
+                        "bbox_gaze_dist_px": mv_bbox_gaze_dist_px,
+                        "bbox_gaze_dist_norm": mv_bbox_gaze_dist_norm,
                     }
                     if save_debug_this:
                         mv_debug_payload[cam] = {
@@ -2458,7 +3001,153 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                         canon = _filter_object_phrase(canon)
                         mv_match_anchor = True if (ok and canon) else False
 
-            if st.TASK1_SEMANTIC_ARBITER:
+            guardrail_candidates = _task1_informative_label_map({
+                "current": canonical_object,
+                "anchor": anchor_label,
+                "multiview": mv_canon,
+                "mask": phrase_from_mask,
+                "mask_context": phrase_from_mask_context,
+                "mask_refined": phrase_from_mask_refined,
+                "mask_refined_large": phrase_from_mask_refined_large,
+                "dot": dot_label_for_canon or phrase_from_dot,
+                "ray": phrase_from_ray,
+            })
+            if teacher_mode:
+                teacher_final["student_label"] = _sanitize_label(canonical_object)
+                teacher_final["candidates"] = guardrail_candidates
+                if st.ARGS.skip_vlm or (not bool(getattr(st, "TASK1_TEACHER_FORCE_CALL", True))):
+                    teacher_final["reason"] = "skip_vlm" if st.ARGS.skip_vlm else "teacher_force_call_disabled"
+                    teacher_final["final_source"] = "student_fallback"
+                    st.REJECT_STATS["t1_teacher_fallback"] += 1
+                else:
+                    teacher_final["triggered"] = True
+                    try:
+                        tpass1 = _run_task1_teacher_pass1(
+                            person_desc=person_desc,
+                            anchor_cam=anchor_cam,
+                            scene_type=split,
+                            ray_context_pil=ray_pil,
+                            student_label=canonical_object,
+                            candidate_labels=guardrail_candidates,
+                            mask_area_ratio=mask_area_ratio,
+                        )
+                    except Exception as e:
+                        st.logger.warning(f"[Task1] teacher pass1 failed; fallback to student label: {e}")
+                        tpass1 = {
+                            "final_label": None,
+                            "confidence": "LOW",
+                            "qwen_verdict": "UNCLEAR",
+                            "rationale": None,
+                            "parse_ok": False,
+                            "parse_status": "request_error",
+                            "parse_partial": False,
+                            "parse_reason": str(e),
+                            "retry_count": 0,
+                            "finish_reason": "",
+                            "token_budget_used": 0,
+                        }
+                    tpass1_history = None
+                    if isinstance(tpass1, dict):
+                        tpass1_history = tpass1.pop("_gemini_history_turn", None)
+                    teacher_final["pass1"] = tpass1
+                    teacher_final["call_count"] = 1
+                    if not bool(tpass1.get("parse_ok")):
+                        st.REJECT_STATS["t1_teacher_parse_fail"] += 1
+                    if int(tpass1.get("retry_count") or 0) > 0:
+                        st.REJECT_STATS["t1_teacher_partial_retry"] += 1
+                    t1_label = _sanitize_label(tpass1.get("final_label"))
+                    t1_conf = str(tpass1.get("confidence") or "LOW").upper()
+                    teacher_final["teacher_label_pass1"] = t1_label
+                    teacher_final["qwen_verdict"] = str(tpass1.get("qwen_verdict") or "UNCLEAR").upper()
+                    teacher_final["teacher_confidence"] = t1_conf
+                    teacher_final["rationale"] = tpass1.get("rationale")
+
+                    student_label = _sanitize_label(canonical_object)
+                    mismatch = _task1_should_run_teacher_second_call(student_label, t1_label)
+                    if student_label and t1_label:
+                        teacher_final["semantic_match_qwen_teacher"] = not mismatch
+                    if mismatch:
+                        st.REJECT_STATS["t1_teacher_conflict"] += 1
+
+                    selected = student_label
+                    selected_source = "student_fallback"
+                    selected_reason = "teacher_invalid_or_low_conf"
+
+                    if _task1_teacher_label_valid(t1_label, t1_conf):
+                        selected = t1_label
+                        selected_source = "teacher_pass1"
+                        selected_reason = "teacher_pass1_valid"
+
+                    if (
+                        mismatch
+                        and int(getattr(st, "TASK1_TEACHER_MAX_CALLS", 2)) > 1
+                        and bool(getattr(st, "TASK1_TEACHER_SECOND_CALL_ON_MISMATCH", True))
+                    ):
+                        st.REJECT_STATS["t1_teacher_second_call"] += 1
+                        try:
+                            tpass2 = _run_task1_teacher_pass2_conflict(
+                                person_desc=person_desc,
+                                anchor_cam=anchor_cam,
+                                scene_type=split,
+                                ray_context_pil=ray_pil,
+                                student_label=student_label,
+                                teacher_label_pass1=t1_label,
+                                candidate_labels=guardrail_candidates,
+                                prior_history_turn=tpass1_history,
+                            )
+                        except Exception as e:
+                            st.logger.warning(f"[Task1] teacher pass2 failed; keeping prior selection: {e}")
+                            tpass2 = {
+                                "final_label": None,
+                                "confidence": "LOW",
+                                "qwen_verdict": "UNCLEAR",
+                                "rationale": None,
+                                "parse_ok": False,
+                                "parse_status": "request_error",
+                                "parse_partial": False,
+                                "parse_reason": str(e),
+                                "retry_count": 0,
+                                "finish_reason": "",
+                                "token_budget_used": 0,
+                            }
+                        if isinstance(tpass2, dict):
+                            tpass2.pop("_gemini_history_turn", None)
+                        teacher_final["pass2"] = tpass2
+                        teacher_final["call_count"] = 2
+                        if not bool(tpass2.get("parse_ok")):
+                            st.REJECT_STATS["t1_teacher_parse_fail"] += 1
+                        if int(tpass2.get("retry_count") or 0) > 0:
+                            st.REJECT_STATS["t1_teacher_partial_retry"] += 1
+                        t2_label = _sanitize_label(tpass2.get("final_label"))
+                        t2_conf = str(tpass2.get("confidence") or "LOW").upper()
+                        teacher_final["teacher_label_pass2"] = t2_label
+                        if t2_label and _task1_teacher_label_valid(t2_label, t2_conf):
+                            selected = t2_label
+                            selected_source = "teacher_pass2"
+                            selected_reason = "teacher_pass2_conflict_resolved"
+                            teacher_final["qwen_verdict"] = str(tpass2.get("qwen_verdict") or "UNCLEAR").upper()
+                            teacher_final["teacher_confidence"] = t2_conf
+                            teacher_final["rationale"] = tpass2.get("rationale")
+
+                    teacher_final["final_source"] = selected_source
+                    teacher_final["final_label"] = selected
+                    teacher_final["reason"] = selected_reason
+                    if selected_source == "student_fallback":
+                        st.REJECT_STATS["t1_teacher_fallback"] += 1
+
+                    if selected and selected != canonical_object:
+                        _append_label_flow(
+                            label_flow,
+                            "teacher_final",
+                            canonical_object,
+                            selected,
+                            selected_reason,
+                        )
+                        canonical_object = selected
+                        teacher_final["applied"] = True
+                        canon_mode = f"{canon_mode}+teacher_final" if canon_mode else "teacher_final"
+
+            if (not teacher_mode) and st.TASK1_SEMANTIC_ARBITER:
                 if st.ARGS.skip_vlm:
                     semantic_arbiter.update({
                         "trigger_reason": "skip_vlm",
@@ -2514,23 +3203,15 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                             arb_mode = str(arb.get("decision") or "refine").strip().lower()
                             canon_mode = f"{canon_mode}+arbiter_{arb_mode}" if canon_mode else f"arbiter_{arb_mode}"
 
-            guardrail_candidates = _task1_informative_label_map({
-                "current": canonical_object,
-                "anchor": anchor_label,
-                "multiview": mv_canon,
-                "mask": phrase_from_mask,
-                "mask_context": phrase_from_mask_context,
-                "mask_refined": phrase_from_mask_refined,
-                "mask_refined_large": phrase_from_mask_refined_large,
-                "dot": dot_label_for_canon or phrase_from_dot,
-                "ray": phrase_from_ray,
-            })
-            if st.TASK1_HYBRID_GUARDRAIL:
+            if (not teacher_mode) and st.TASK1_HYBRID_GUARDRAIL:
                 if st.ARGS.skip_vlm:
                     hybrid_guardrail.update({
                         "trigger_reason": "skip_vlm",
                         "triggered": False,
                         "applied": False,
+                        "applied_by": "none",
+                        "proposed_passed_gate": False,
+                        "blocked_reason": "skip_vlm",
                         "candidates": guardrail_candidates,
                     })
                 else:
@@ -2548,7 +3229,7 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                             anchor_cam=anchor_cam,
                             scene_type=split,
                             anchor_resized=anchor_resized,
-                            ray_label_prompt_pil=ray_label_prompt_pil,
+                            ray_context_pil=ray_pil,
                             masked_crop=masked_crop,
                             dot_mask_crop=dot_mask_crop,
                             current_label=canonical_object,
@@ -2557,6 +3238,7 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                         )
                         hybrid_guardrail.update(grd)
                         proposed = _sanitize_label(grd.get("final_label"))
+                        hybrid_guardrail["proposed_label"] = proposed
                         conf = str(grd.get("confidence") or "LOW").upper()
                         min_conf = str(getattr(st, "TASK1_GUARDRAIL_MIN_CONF", "MEDIUM")).upper()
                         enough_conf = _conf_rank(conf) >= _conf_rank(min_conf)
@@ -2581,37 +3263,51 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                         improves_cues = new_hits > cur_hits
                         decision = str(grd.get("decision") or "").strip().upper()
                         switch_intent = decision.startswith("SWITCH") or decision == "REFINE"
-                        should_apply = bool(
+                        proposal_passed_gate = bool(
                             proposed
                             and scene_ok
                             and (enough_conf or ambiguous_now or (not canonical_object))
                             and (improves_cues or switch_intent or ambiguous_now)
                         )
+                        hybrid_guardrail["proposed_passed_gate"] = bool(proposal_passed_gate)
+                        hybrid_guardrail["blocked_reason"] = None if proposal_passed_gate else "proposal_gate_fail"
 
-                        selected = proposed
-                        if (
-                            should_apply
-                            and bool(getattr(st, "TASK1_GUARDRAIL_QWEN_REFINE", True))
-                            and str(getattr(st, "VLM_PROVIDER", "")).lower() == "qwen"
-                        ):
-                            qref = _run_task1_qwen_guided_refine(
-                                current_label=canonical_object,
-                                guardrail_label=proposed,
-                                candidate_labels=guardrail_candidates,
-                                anchor_resized=anchor_resized,
-                                ray_label_prompt_pil=ray_label_prompt_pil,
-                                masked_crop=masked_crop,
-                                dot_mask_crop=dot_mask_crop,
-                            )
-                            hybrid_guardrail["qwen_refine"] = qref
-                            qlab = _sanitize_label(qref.get("final_label"))
-                            allowed = qref.get("allowed_labels") or []
-                            qmatch = any(_labels_relaxed_match(qlab, a) for a in allowed) if qlab else False
-                            if qlab and qmatch:
-                                if _conf_rank(qref.get("confidence")) >= _conf_rank("MEDIUM") or ambiguous_now:
+                        selected = canonical_object
+                        if proposal_passed_gate:
+                            qwen_refine_enabled = bool(getattr(st, "TASK1_GUARDRAIL_QWEN_REFINE", True))
+                            provider_is_qwen = str(getattr(st, "VLM_PROVIDER", "")).lower() == "qwen"
+                            if not qwen_refine_enabled:
+                                hybrid_guardrail["blocked_reason"] = "qwen_refine_disabled"
+                            elif not provider_is_qwen:
+                                hybrid_guardrail["blocked_reason"] = "qwen_missing"
+                            else:
+                                qref = _run_task1_qwen_guided_refine(
+                                    current_label=canonical_object,
+                                    guardrail_label=proposed,
+                                    candidate_labels=guardrail_candidates,
+                                    anchor_resized=anchor_resized,
+                                    ray_label_prompt_pil=ray_label_prompt_pil,
+                                    masked_crop=masked_crop,
+                                    dot_mask_crop=dot_mask_crop,
+                                    guardrail_rationale=grd.get("rationale"),
+                                    guardrail_scene_setting=grd.get("scene_setting"),
+                                    guardrail_target_local_context=grd.get("target_local_context"),
+                                )
+                                hybrid_guardrail["qwen_refine"] = qref
+                                qlab = _sanitize_label(qref.get("final_label"))
+                                allowed = qref.get("allowed_labels") or []
+                                qmatch = any(_labels_relaxed_match(qlab, a) for a in allowed) if qlab else False
+                                conf_ok = _conf_rank(qref.get("confidence")) >= _conf_rank("MEDIUM") or ambiguous_now
+                                if not qlab:
+                                    hybrid_guardrail["blocked_reason"] = "qwen_missing_label"
+                                elif not qmatch:
+                                    hybrid_guardrail["blocked_reason"] = "qwen_no_match"
+                                elif not conf_ok:
+                                    hybrid_guardrail["blocked_reason"] = "qwen_low_conf"
+                                else:
                                     selected = qlab
 
-                        if should_apply and selected and selected != canonical_object:
+                        if proposal_passed_gate and selected and selected != canonical_object:
                             _append_label_flow(
                                 label_flow,
                                 "hybrid_guardrail",
@@ -2621,8 +3317,13 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                             )
                             canonical_object = selected
                             hybrid_guardrail["applied"] = True
+                            hybrid_guardrail["applied_by"] = "qwen_refine"
+                            hybrid_guardrail["blocked_reason"] = None
                             grd_mode = str(grd.get("decision") or "refine").strip().lower()
-                            canon_mode = f"{canon_mode}+guardrail_{grd_mode}" if canon_mode else f"guardrail_{grd_mode}"
+                            canon_mode = (
+                                f"{canon_mode}+guardrail_guide_{grd_mode}"
+                                if canon_mode else f"guardrail_guide_{grd_mode}"
+                            )
 
             if _is_ambiguous_label(canonical_object) and anchor_idx < (len(anchor_cands) - 1):
                 st.logger.info(
@@ -2681,8 +3382,17 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
             if hybrid_guardrail.get("applied") and hybrid_guardrail.get("rationale"):
                 rationale = _first_two_sentences(hybrid_guardrail.get("rationale"))
                 if rationale:
+                    guardrail_src = "Scene guardrail (guide-only)"
+                    if hybrid_guardrail.get("applied_by") == "qwen_refine":
+                        guardrail_src = "Scene guardrail (guide-only, Qwen-applied)"
                     reasoning = _first_two_sentences(
-                        f"{reasoning} Scene guardrail: {rationale}."
+                        f"{reasoning} {guardrail_src}: {rationale}."
+                    ) or reasoning
+            if teacher_final.get("applied") and teacher_final.get("rationale"):
+                rationale = _first_two_sentences(teacher_final.get("rationale"))
+                if rationale:
+                    reasoning = _first_two_sentences(
+                        f"{reasoning} Teacher verifier: {rationale}."
                     ) or reasoning
 
             pose_check = None
@@ -2795,6 +3505,7 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                     "canonical_mode": canon_mode,
                     "semantic_arbiter": semantic_arbiter,
                     "hybrid_guardrail": hybrid_guardrail,
+                    "teacher_final": teacher_final,
                     "segmentation_try": seg_used,
                 })
 
@@ -2849,6 +3560,7 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                     "positional_label": positional_label,
                     "semantic_arbiter": semantic_arbiter,
                     "hybrid_guardrail": hybrid_guardrail,
+                    "teacher_final": teacher_final,
                     **audit_geom
                 },
                 "input_cams": cams,

@@ -9,7 +9,7 @@
 #SBATCH --mem=32g
 #SBATCH --constraint="scratch"
 #SBATCH --gpu-bind=closest
-#SBATCH --job-name=gazevqa-matrix20
+#SBATCH --job-name=gazevqa-guardrail20
 #SBATCH --output=/work/nvme/bfga/jlee65/gaze_vqa/runs/slurm_%x_%j.out
 #SBATCH --error=/work/nvme/bfga/jlee65/gaze_vqa/runs/slurm_%x_%j.err
 #SBATCH --mail-user=jl193@illinois.edu
@@ -31,7 +31,6 @@ echo "[INFO] Host: $(hostname)"
 echo "[INFO] Start: $(date)"
 echo "[INFO] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 
-# Use containerized Python by default on Delta to ensure torch+cuda stack exists.
 USE_APPTAINER="${USE_APPTAINER:-1}"
 SIF="${SIF:-/work/nvme/bfga/jlee65/jun_fm.sif}"
 
@@ -53,7 +52,6 @@ else
   echo "[INFO] Runtime: host python3"
 fi
 
-# Force all caches to node-local writable tmp to avoid read-only bind issues.
 JOB_TMP_BASE="/tmp/${USER}/gazevqa_${SLURM_JOB_ID:-manual}"
 mkdir -p "${JOB_TMP_BASE}/hf/hub" "${JOB_TMP_BASE}/hf/transformers" "${JOB_TMP_BASE}/xdg" "${JOB_TMP_BASE}/pip"
 export HF_HOME="${JOB_TMP_BASE}/hf"
@@ -83,8 +81,6 @@ fi
 
 run_python -c "import sys; print('[INFO] Python:', sys.executable); import torch; print('[INFO] torch:', torch.__version__)"
 
-# Keep defaults deterministic and no partial acceptance.
-# --allow_partial_tasks is intentionally NOT passed.
 COMMON_ARGS=(
   --out_root "${ROOT}"
   --targets 20 20 20 20
@@ -93,57 +89,57 @@ COMMON_ARGS=(
   --reasoning_mode gt
   --task1_reasoning_mode vlm
   --task1_conf_threshold 0.35
-  --task1_semantic_arbiter
   --task1_seg_preset clahe_bilateral
   --max_frames 1200
   --no_scan_dataset_stats
 )
 
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
+SCRIPT_TAG="$(basename "${BASH_SOURCE[0]}" .sbatch)"
+RUN_NAME="${RUN_STAMP}_${SCRIPT_TAG}_qwen_teacher_task4verifier"
+TASK1_TEACHER_MODEL="${TASK1_TEACHER_MODEL:-gemini-3-flash-preview}"
+TASK4_VERIFIER_MODEL="${TASK4_VERIFIER_MODEL:-gemini-3-flash-preview}"
+GEMINI_FALLBACK_MODELS="${GEMINI_FALLBACK_MODELS:-gemini-2.5-flash,gemini-2.0-flash,gemini-1.5-flash}"
+export GEMINI_FALLBACK_MODELS
 
-run_case() {
-  local name="$1"
-  shift
-  local run_name="${RUN_STAMP}_${name}"
-  echo
-  echo "=============================="
-  echo "[RUN] ${run_name}"
-  echo "=============================="
-  run_python "${ROOT}/generate_benchmark_delta.py" \
-    "${COMMON_ARGS[@]}" \
-    --run_name "${run_name}" \
-    "$@"
-}
+echo
+echo "=============================="
+echo "[RUN] ${RUN_NAME}"
+echo "=============================="
+echo "[INFO] Gemini fallback models: ${GEMINI_FALLBACK_MODELS}"
 
-# 1) Qwen default baseline
-run_case "qwen_default" \
-  --vlm_provider qwen
-
-# 2) Gemini-only baseline
-run_case "gemini_only" \
-  --vlm_provider gemini
-
-# 3) Qwen primary + Gemini guardrail (no scene plausibility check)
-run_case "qwen_hybrid_guardrail_no_scene" \
+run_python "${ROOT}/generate_benchmark_delta.py" \
+  "${COMMON_ARGS[@]}" \
+  --run_name "${RUN_NAME}" \
   --vlm_provider qwen \
-  --task1_hybrid_guardrail \
-  --task1_guardrail_provider gemini \
-  --task1_guardrail_min_conf MEDIUM \
-  --task1_guardrail_gemini_thinking_budget 48 \
-  --task1_guardrail_gemini_top_p 0.85 \
-  --task1_guardrail_gemini_top_k 32 \
-  --task1_guardrail_disable_scene_check
-
-# 4) Qwen primary + Gemini guardrail (scene plausibility check enabled)
-run_case "qwen_hybrid_guardrail_scene" \
-  --vlm_provider qwen \
-  --task1_hybrid_guardrail \
-  --task1_guardrail_provider gemini \
-  --task1_guardrail_min_conf MEDIUM \
-  --task1_guardrail_gemini_thinking_budget 48 \
-  --task1_guardrail_gemini_top_p 0.85 \
-  --task1_guardrail_gemini_top_k 32
+  --task1_teacher_final \
+  --task1_teacher_provider gemini \
+  --task1_teacher_model "${TASK1_TEACHER_MODEL}" \
+  --task1_teacher_force_call \
+  --task1_teacher_max_calls 2 \
+  --task1_teacher_second_call_on_mismatch \
+  --task1_teacher_min_conf MEDIUM \
+  --task1_teacher_temperature 0.2 \
+  --task1_teacher_max_new_tokens 512 \
+  --task1_teacher_gemini_thinking_level medium \
+  --task1_teacher_gemini_thinking_budget 64 \
+  --task1_teacher_gemini_media_resolution high \
+  --task1_teacher_structured_json \
+  --task1_teacher_retry_on_partial_json \
+  --task1_teacher_retry_token_multiplier 2.0 \
+  --task4_gemini_verifier \
+  --task4_gemini_verifier_model "${TASK4_VERIFIER_MODEL}" \
+  --task4_gemini_verifier_min_flip_conf HIGH \
+  --task4_gemini_verifier_reject_on_uncertain_conflict \
+  --task4_gemini_verifier_max_new_tokens 192 \
+  --task4_gemini_verifier_temperature 0.2 \
+  --task4_gemini_verifier_thinking_level low \
+  --task4_gemini_verifier_thinking_budget 32 \
+  --task4_gemini_verifier_media_resolution high \
+  --task4_gemini_verifier_structured_json \
+  --task4_gemini_verifier_retry_on_partial_json \
+  --task4_gemini_verifier_retry_token_multiplier 2.0
 
 echo
 echo "[INFO] Finished: $(date)"
-echo "[INFO] Runs written under: ${ROOT}/runs"
+echo "[INFO] Run written under: ${ROOT}/runs/${RUN_NAME}"

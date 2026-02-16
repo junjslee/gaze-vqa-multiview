@@ -577,14 +577,47 @@ def draw_dot_on_crop(crop_pil, point_xy_scaled, crop_bb, alpha=0.5, full_wh=None
     if cx < 0 or cy < 0 or cx >= Wc or cy >= Hc:
         return crop_pil
 
+    # Use a shape-coded cue (ring + crosshair) instead of a filled color dot.
+    # This reduces label leakage for color-sensitive objects (e.g., red tomato).
     base = crop_pil.convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    r = max(2, int(st.GAZE_DOT_R * 0.75))
-    if color is None:
-        color = st.GAZE_COLOR
-    color = (color[0], color[1], color[2], int(255 * alpha))
-    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
+    cx_i, cy_i = int(round(cx)), int(round(cy))
+
+    max_r = max(3, int(min(Wc, Hc) * 0.18))
+    r = max(3, min(max_r, int(round(st.GAZE_DOT_R * 0.9))))
+    alpha_i = int(max(64, min(255, round(255.0 * float(alpha)))))
+
+    outer_w = max(1, int(round(r * 0.45)))
+    inner_w = max(1, int(round(r * 0.30)))
+    cross_w = max(1, int(round(r * 0.25)))
+    r_inner = max(2, r - max(1, outer_w))
+
+    # Outer black ring + inner white ring.
+    draw.ellipse(
+        [cx_i - r, cy_i - r, cx_i + r, cy_i + r],
+        outline=(0, 0, 0, alpha_i),
+        width=outer_w,
+    )
+    draw.ellipse(
+        [cx_i - r_inner, cy_i - r_inner, cx_i + r_inner, cy_i + r_inner],
+        outline=(255, 255, 255, alpha_i),
+        width=inner_w,
+    )
+
+    # White crosshair centered on gaze point.
+    cross_len = max(2, int(round(r * 0.85)))
+    draw.line(
+        [cx_i - cross_len, cy_i, cx_i + cross_len, cy_i],
+        fill=(255, 255, 255, alpha_i),
+        width=cross_w,
+    )
+    draw.line(
+        [cx_i, cy_i - cross_len, cx_i, cy_i + cross_len],
+        fill=(255, 255, 255, alpha_i),
+        width=cross_w,
+    )
+
     return Image.alpha_composite(base, overlay).convert("RGB")
 
 
