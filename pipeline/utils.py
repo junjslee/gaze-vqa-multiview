@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import html as html_lib
 from pathlib import Path
 from collections import Counter
@@ -22,6 +23,245 @@ def make_id(*parts):
 def log_debug(obj: dict):
     with open(st.DEBUG_MANIFEST, "a") as f:
         f.write(json.dumps(obj) + "\n")
+
+
+def _atomic_write_json(path: Path, payload: dict):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, path)
+
+
+def checkpoint_bundle_key(split, seq, frame_id):
+    return f"{split}/{seq}/{frame_id}"
+
+
+def append_checkpoint_samples(samples, bundle_key):
+    if not samples:
+        return
+    st.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(st.CHECKPOINT_ACCEPTED_SAMPLES_JSONL, "a") as f:
+        for s in samples:
+            rec = {
+                "bundle_key": str(bundle_key),
+                "task_id": int((s or {}).get("task_id") or 0) if isinstance(s, dict) else 0,
+                "sample": s,
+            }
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def append_checkpoint_bundle(bundle_key, split=None, seq=None, frame_id=None):
+    st.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "bundle_key": str(bundle_key),
+        "split": split,
+        "seq": seq,
+        "frame_id": frame_id,
+        "ts": int(time.time()),
+    }
+    with open(st.CHECKPOINT_ACCEPTED_BUNDLES_JSONL, "a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _recompute_counts_from_samples(samples, accepted_bundle_keys):
+    counts = {"task1": 0, "task2": 0, "task3": 0, "task4": 0}
+    for s in samples:
+        if not isinstance(s, dict):
+            continue
+        tid = int(s.get("task_id") or 0)
+        if tid in (1, 2, 3, 4):
+            counts[f"task{tid}"] += 1
+    if st.REQUIRE_ALL_TASKS_PER_FRAME:
+        counts["bundle"] = int(len(accepted_bundle_keys))
+    return counts
+
+
+def write_resume_state(counts, sample_count, accepted_bundle_count, last_bundle_key=None, checkpoint_events=0):
+    payload = {
+        "run_name": st.RUN_NAME,
+        "run_dir": str(st.RUN_DIR),
+        "updated_at_epoch": int(time.time()),
+        "counts": counts,
+        "sample_count": int(sample_count),
+        "accepted_bundle_count": int(accepted_bundle_count),
+        "last_bundle_key": last_bundle_key,
+        "checkpoint_events": int(checkpoint_events),
+        "reject_stats": st.REJECT_STATS,
+        "frame_stats": st.FRAME_STATS,
+        "gemini_error_stats": st.GEMINI_ERROR_STATS,
+    }
+    _atomic_write_json(st.CHECKPOINT_STATE_JSON, payload)
+
+
+def load_checkpoint_state():
+    samples = []
+    accepted_bundle_keys = set()
+    state_payload = {}
+
+    if st.CHECKPOINT_ACCEPTED_BUNDLES_JSONL.exists():
+        with open(st.CHECKPOINT_ACCEPTED_BUNDLES_JSONL, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(rec, dict):
+                    bk = str(rec.get("bundle_key") or "").strip()
+                else:
+                    bk = str(rec).strip()
+                if bk:
+                    accepted_bundle_keys.add(bk)
+
+    if st.CHECKPOINT_ACCEPTED_SAMPLES_JSONL.exists():
+        with open(st.CHECKPOINT_ACCEPTED_SAMPLES_JSONL, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                sample = None
+                if isinstance(rec, dict) and isinstance(rec.get("sample"), dict):
+                    sample = rec.get("sample")
+                    bk = str(rec.get("bundle_key") or "").strip()
+                    if bk:
+                        accepted_bundle_keys.add(bk)
+                elif isinstance(rec, dict) and int(rec.get("task_id") or 0) in (1, 2, 3, 4):
+                    sample = rec
+                if isinstance(sample, dict):
+                    samples.append(sample)
+
+    if st.CHECKPOINT_STATE_JSON.exists():
+        try:
+            with open(st.CHECKPOINT_STATE_JSON, "r") as f:
+                state_payload = json.load(f) or {}
+        except Exception:
+            state_payload = {}
+
+    counts = state_payload.get("counts") if isinstance(state_payload, dict) else None
+    if not isinstance(counts, dict):
+        counts = _recompute_counts_from_samples(samples, accepted_bundle_keys)
+    else:
+        base = _recompute_counts_from_samples(samples, accepted_bundle_keys)
+        for k, v in base.items():
+            counts[k] = int(max(int(counts.get(k) or 0), int(v or 0)))
+        if st.REQUIRE_ALL_TASKS_PER_FRAME:
+            counts["bundle"] = int(max(int(counts.get("bundle") or 0), len(accepted_bundle_keys)))
+
+    return {
+        "samples": samples,
+        "accepted_bundle_keys": accepted_bundle_keys,
+        "counts": counts,
+        "reject_stats": state_payload.get("reject_stats") if isinstance(state_payload, dict) else None,
+        "frame_stats": state_payload.get("frame_stats") if isinstance(state_payload, dict) else None,
+        "checkpoint_events": int(state_payload.get("checkpoint_events") or 0) if isinstance(state_payload, dict) else 0,
+        "last_bundle_key": state_payload.get("last_bundle_key") if isinstance(state_payload, dict) else None,
+    }
+
+
+def write_run_status(status, reason="", extra=None):
+    payload = {
+        "status": str(status),
+        "reason": str(reason or ""),
+        "run_name": st.RUN_NAME,
+        "run_dir": str(st.RUN_DIR),
+        "timestamp_epoch": int(time.time()),
+    }
+    if isinstance(extra, dict) and extra:
+        payload["extra"] = extra
+    _atomic_write_json(st.RUN_STATUS_JSON, payload)
+
+
+def _safe_inc_map(d, key, inc=1):
+    k = str(key or "unknown")
+    d[k] = int(d.get(k, 0)) + int(inc)
+
+
+def log_gemini_error(obj: dict):
+    rec = dict(obj or {})
+    rec["timestamp_epoch"] = int(time.time())
+    rec["frame_key"] = str(rec.get("frame_key") or st.CURRENT_FRAME_KEY or "")
+    task_id = int(rec.get("task_id") or 0)
+    stage = str(rec.get("stage") or "unknown")
+    err_type = str(rec.get("error_type") or "unknown")
+    model_name = str(rec.get("model") or rec.get("model_requested") or "")
+
+    st.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(st.GEMINI_ERROR_LOG_JSONL, "a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    st.REJECT_STATS["gemini_error_events"] = int(st.REJECT_STATS.get("gemini_error_events", 0)) + 1
+    if task_id == 1:
+        st.REJECT_STATS["t1_gemini_error"] = int(st.REJECT_STATS.get("t1_gemini_error", 0)) + 1
+    elif task_id == 4:
+        st.REJECT_STATS["t4_gemini_error"] = int(st.REJECT_STATS.get("t4_gemini_error", 0)) + 1
+
+    st.GEMINI_ERROR_STATS["total"] = int(st.GEMINI_ERROR_STATS.get("total", 0)) + 1
+    _safe_inc_map(st.GEMINI_ERROR_STATS.setdefault("by_task", {}), task_id if task_id else "unknown")
+    _safe_inc_map(st.GEMINI_ERROR_STATS.setdefault("by_stage", {}), stage)
+    _safe_inc_map(st.GEMINI_ERROR_STATS.setdefault("by_type", {}), err_type)
+    _safe_inc_map(st.GEMINI_ERROR_STATS.setdefault("by_model", {}), model_name or "unknown")
+
+    msg = str(rec.get("message") or rec.get("parse_reason") or "")[:240]
+    st.logger.warning(
+        "[GEMINI-ERROR] task=%s stage=%s type=%s model=%s frame=%s msg=%s",
+        task_id if task_id else "unknown",
+        stage,
+        err_type,
+        model_name or "unknown",
+        rec.get("frame_key") or "unknown",
+        msg,
+    )
+
+
+def seed_gemini_error_stats_from_log():
+    st.GEMINI_ERROR_STATS = {
+        "total": 0,
+        "by_task": {},
+        "by_stage": {},
+        "by_type": {},
+        "by_model": {},
+    }
+    if not st.GEMINI_ERROR_LOG_JSONL.exists():
+        return
+    with open(st.GEMINI_ERROR_LOG_JSONL, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            task_id = rec.get("task_id", "unknown")
+            stage = rec.get("stage", "unknown")
+            err_type = rec.get("error_type", "unknown")
+            model_name = rec.get("model") or rec.get("model_requested") or "unknown"
+            st.GEMINI_ERROR_STATS["total"] += 1
+            _safe_inc_map(st.GEMINI_ERROR_STATS.setdefault("by_task", {}), task_id)
+            _safe_inc_map(st.GEMINI_ERROR_STATS.setdefault("by_stage", {}), stage)
+            _safe_inc_map(st.GEMINI_ERROR_STATS.setdefault("by_type", {}), err_type)
+            _safe_inc_map(st.GEMINI_ERROR_STATS.setdefault("by_model", {}), model_name)
+
+
+def write_gemini_error_summary(path=None):
+    out_path = Path(path or st.GEMINI_ERROR_SUMMARY_JSON)
+    out = {
+        "run_name": st.RUN_NAME,
+        "run_dir": str(st.RUN_DIR),
+        "generated_at_epoch": int(time.time()),
+        "stats": st.GEMINI_ERROR_STATS,
+        "log_path": str(st.GEMINI_ERROR_LOG_JSONL),
+    }
+    _atomic_write_json(out_path, out)
+    return str(out_path)
 
 
 def _short_reject_report():
@@ -230,12 +470,14 @@ def write_snapshot_if_needed(samples, counts, every=5):
     total = counts["task1"] + counts["task2"] + counts["task3"] + counts["task4"]
     if total % every != 0:
         return
-    snap_path = st.RUN_DIR / "snapshot_progress.json"
+    snap_path = st.SNAPSHOT_JSON
     with open(snap_path, "w") as f:
         json.dump({
             "counts": counts,
             "reject_stats": st.REJECT_STATS,
             "frame_stats": st.FRAME_STATS,
+            "gemini_errors": st.GEMINI_ERROR_STATS,
+            "checkpoint": st.CHECKPOINT_STATE,
             "gemini_teacher_verifier": summarize_teacher_verifier(samples),
             "last_samples": _short_last_samples(samples, k=5),
         }, f, indent=2)

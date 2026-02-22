@@ -9,7 +9,7 @@
 #SBATCH --mem=240g
 #SBATCH --constraint="scratch"
 #SBATCH --gpu-bind=closest
-#SBATCH --job-name=gazevqa-eval-campaign
+#SBATCH --job-name=gazevqa-eval-campaign-prop
 #SBATCH --output=/work/nvme/bfga/jlee65/gaze_vqa/runs/slurm_%x_%j.out
 #SBATCH --error=/work/nvme/bfga/jlee65/gaze_vqa/runs/slurm_%x_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -28,10 +28,8 @@ cd "${ROOT}"
 
 USE_APPTAINER="${USE_APPTAINER:-1}"
 SIF="${SIF:-/work/nvme/bfga/jlee65/jun_fm.sif}"
-CAMPAIGN_NAME="${CAMPAIGN_NAME:-campaign_$(date +%Y%m%d_%H%M%S)}"
+CAMPAIGN_NAME="${CAMPAIGN_NAME:-campaign_proprietary_$(date +%Y%m%d_%H%M%S)}"
 BENCHMARK_PATH="${BENCHMARK_PATH:-}"
-RUN_TRACK_A="${RUN_TRACK_A:-1}"
-RUN_TRACK_B="${RUN_TRACK_B:-1}"
 RUN_JUDGE="${RUN_JUDGE:-1}"
 RUN_AGGREGATE="${RUN_AGGREGATE:-1}"
 JUDGE_MODEL="${JUDGE_MODEL:-gemini-3.1-pro-preview}"
@@ -39,6 +37,8 @@ REQUEST_INTERVAL="${REQUEST_INTERVAL:-0.0}"
 GEMINI_REQUEST_INTERVAL="${GEMINI_REQUEST_INTERVAL:-30.0}"
 JUDGE_REQUEST_INTERVAL="${JUDGE_REQUEST_INTERVAL:-0.0}"
 RESET_PREDICTIONS="${RESET_PREDICTIONS:-0}"
+RUN_GEMINI_ONLY="${RUN_GEMINI_ONLY:-0}"
+RUN_INCLUDE_GEMINI="${RUN_INCLUDE_GEMINI:-0}"
 RUN_GEMINI20FLASH="${RUN_GEMINI20FLASH:-1}"
 SERVER_READY_RETRIES="${SERVER_READY_RETRIES:-900}"
 SERVER_READY_SLEEP_S="${SERVER_READY_SLEEP_S:-2}"
@@ -79,16 +79,6 @@ else
 fi
 
 CAMPAIGN_PATH="${ROOT}/runs/eval_campaigns/${CAMPAIGN_NAME}"
-
-TRACK_A_MODELS=(
-  "gpt41"
-  "gpt4o"
-  "qwen3vl_alias"
-  "internvl25"
-  "deepseekvl2"
-  "llava_video_7b"
-  "llava_ov_7b"
-)
 GEMINI_MODELS=(
   "gemini25flash"
   "gemini30flash"
@@ -96,37 +86,39 @@ GEMINI_MODELS=(
   "gemini30pro"
 )
 if [[ "${RUN_GEMINI20FLASH}" == "1" ]]; then
-  GEMINI_MODELS=("gemini20flash" "${GEMINI_MODELS[@]}")
-fi
-TRACK_A_MODELS=("${GEMINI_MODELS[@]}" "${TRACK_A_MODELS[@]}")
-TRACK_B_MODELS=(
-  "llava_video_72b"
-  "llava_ov_72b"
-  "llava_next_8b"
-  "llava_next_32b"
-)
-
-if [[ "${RUN_TRACK_A}" == "1" ]]; then
-  for model_key in "${TRACK_A_MODELS[@]}"; do
-    model_request_interval="${REQUEST_INTERVAL}"
-    if [[ "${model_key}" == gemini* ]]; then
-      model_request_interval="${GEMINI_REQUEST_INTERVAL}"
-    fi
-    echo "[INFO] Running model: ${model_key}"
-    CAMPAIGN="${CAMPAIGN_PATH}" MODEL_KEY="${model_key}" USE_APPTAINER="${USE_APPTAINER}" SIF="${SIF}" REQUEST_INTERVAL="${model_request_interval}" RESET_PREDICTIONS="${RESET_PREDICTIONS}" \
-      SERVER_READY_RETRIES="${SERVER_READY_RETRIES}" SERVER_READY_SLEEP_S="${SERVER_READY_SLEEP_S}" SERVER_LOG_DIR="${SERVER_LOG_DIR}" SERVER_LOG_TAIL_LINES="${SERVER_LOG_TAIL_LINES}" \
-      srun bash "${ROOT}/sbatch_eval_model.sbatch"
-  done
+  GEMINI_MODELS=(
+    "gemini20flash"
+    "${GEMINI_MODELS[@]}"
+  )
 fi
 
-if [[ "${RUN_TRACK_B}" == "1" ]]; then
-  for model_key in "${TRACK_B_MODELS[@]}"; do
-    echo "[INFO] Running model: ${model_key}"
-    CAMPAIGN="${CAMPAIGN_PATH}" MODEL_KEY="${model_key}" USE_APPTAINER="${USE_APPTAINER}" SIF="${SIF}" REQUEST_INTERVAL="${REQUEST_INTERVAL}" RESET_PREDICTIONS="${RESET_PREDICTIONS}" \
-      SERVER_READY_RETRIES="${SERVER_READY_RETRIES}" SERVER_READY_SLEEP_S="${SERVER_READY_SLEEP_S}" SERVER_LOG_DIR="${SERVER_LOG_DIR}" SERVER_LOG_TAIL_LINES="${SERVER_LOG_TAIL_LINES}" \
-      srun bash "${ROOT}/sbatch_eval_model.sbatch"
-  done
+if [[ "${RUN_GEMINI_ONLY}" == "1" ]]; then
+  MODELS=("${GEMINI_MODELS[@]}")
+  echo "[INFO] RUN_GEMINI_ONLY=1 -> running Gemini models only."
+elif [[ "${RUN_INCLUDE_GEMINI}" == "1" ]]; then
+  MODELS=(
+    "gpt41"
+    "gpt4o"
+    "${GEMINI_MODELS[@]}"
+  )
+  echo "[INFO] RUN_INCLUDE_GEMINI=1 -> running GPT + Gemini proprietary models."
+else
+  MODELS=(
+    "gpt41"
+    "gpt4o"
+  )
 fi
+
+for model_key in "${MODELS[@]}"; do
+  model_request_interval="${REQUEST_INTERVAL}"
+  if [[ "${model_key}" == gemini* ]]; then
+    model_request_interval="${GEMINI_REQUEST_INTERVAL}"
+  fi
+  echo "[INFO] Running model: ${model_key}"
+  CAMPAIGN="${CAMPAIGN_PATH}" MODEL_KEY="${model_key}" USE_APPTAINER="${USE_APPTAINER}" SIF="${SIF}" REQUEST_INTERVAL="${model_request_interval}" RESET_PREDICTIONS="${RESET_PREDICTIONS}" \
+    SERVER_READY_RETRIES="${SERVER_READY_RETRIES}" SERVER_READY_SLEEP_S="${SERVER_READY_SLEEP_S}" SERVER_LOG_DIR="${SERVER_LOG_DIR}" SERVER_LOG_TAIL_LINES="${SERVER_LOG_TAIL_LINES}" \
+    srun bash "${ROOT}/sbatch_eval_model.sbatch"
+done
 
 if [[ "${RUN_JUDGE}" == "1" ]]; then
   run_python "${ROOT}/evaluate_benchmark_delta.py" judge \
@@ -140,4 +132,4 @@ if [[ "${RUN_AGGREGATE}" == "1" ]]; then
     --campaign "${CAMPAIGN_PATH}"
 fi
 
-echo "[INFO] Campaign complete: ${CAMPAIGN_PATH}"
+echo "[INFO] Proprietary campaign complete: ${CAMPAIGN_PATH}"

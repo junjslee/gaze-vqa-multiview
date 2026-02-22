@@ -139,7 +139,7 @@ def prompt_masked_object(scene_type=None):
         "If it only appears aligned in 2D but is farther away (e.g., a wall-mounted air conditioner above a foosball table), do NOT say 'on'.\n"
         "If a small item (clearly distinguishable) sits on a larger surface, you may answer '<small> on <large>'.\n"
         "Be specific (avoid generic terms like 'furniture' or 'object', 'thing', 'square/box').\n"
-        "Use relative background and setting information (if possible, then run chain thoughts) to help identify the object).\n"
+        "Use surrounding scene context to disambiguate the object when needed.\n"
         "Examples: 'piano', 'kitchen sink', 'red mug', 'book on table', 'plastic plate', 'glass plate', 'blue cup', 'white bottle', 'metal faucet'."
     )
 
@@ -207,7 +207,7 @@ def prompt_task1_reasoning_rich(person_desc, canonical_object, scene_type=None):
         "Ground the explanation in visible spatial cues: head direction, body orientation, left/right/behind, "
         "and relative placement of the object.\n"
         "Do not mention overlays, gaze rays, masks, annotations, or ground-truth sources. "
-        "Do not treat cue marks (ring/crosshair marker) as real objects (e.g., red tomato)."
+        "Do not treat cue marks (ring/crosshair marker) as real objects; if the true object is a tomato, keep tomato/red tomato."
     )
 
 

@@ -53,7 +53,7 @@ def _judge_with_gemini(client, model: str, prompt: str, retry: int = 3, backoff:
 def judge_json(
     input_path: Path,
     output_path: Path,
-    model: str = "gemini-2.5-flash",
+    model: str = "gemini-3.1-pro-preview",
     api_key: str = "",
     retry: int = 3,
     retry_backoff: float = 2.0,
@@ -144,7 +144,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Gemini judge for model prediction JSON.")
     p.add_argument("--input_path", type=Path, required=True)
     p.add_argument("--output_path", type=Path, required=True)
-    p.add_argument("--model", type=str, default="gemini-2.5-flash")
+    p.add_argument("--model", type=str, default="gemini-3.1-pro-preview")
     p.add_argument("--api_key", type=str, default="")
     p.add_argument("--retry", type=int, default=3)
     p.add_argument("--retry_backoff", type=float, default=2.0)
@@ -172,4 +172,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -29,9 +29,17 @@ from .utils import (
     write_frame_debug,
     summarize_teacher_verifier,
     write_gemini_teacher_verifier_report,
+    checkpoint_bundle_key,
+    append_checkpoint_samples,
+    append_checkpoint_bundle,
+    write_resume_state,
+    load_checkpoint_state,
+    write_run_status,
+    seed_gemini_error_stats_from_log,
+    write_gemini_error_summary,
+    _resize,
 )
 from .io_utils import save_raw_cam_images_parallel, zip_read_image
-from .utils import _resize
 
 
 def quotas_met(counts):
@@ -46,12 +54,13 @@ def quotas_met(counts):
 
 
 def generate_benchmark_single():
+    write_run_status("running", reason="resume" if st.RESUME_ENABLED else "start")
     ensure_mvgt_zip()
     ensure_sam2()
     if not st.ARGS.skip_vlm:
         warmup_vlm()
 
-    if st.SAVE_DEBUG and st.DEBUG_MANIFEST.exists():
+    if st.SAVE_DEBUG and st.DEBUG_MANIFEST.exists() and (not st.RESUME_ENABLED):
         try:
             st.DEBUG_MANIFEST.unlink()
         except Exception:
@@ -61,8 +70,89 @@ def generate_benchmark_single():
     if st.REQUIRE_ALL_TASKS_PER_FRAME:
         counts["bundle"] = 0
     samples = []
+    accepted_bundle_keys = set()
+    checkpoint_events = 0
+    last_bundle_key = None
 
     partial_json = st.RUN_DIR / "partial_rank0.json"
+
+    if st.RESUME_ENABLED:
+        resumed = load_checkpoint_state()
+        resumed_samples = resumed.get("samples") or []
+        resumed_keys = resumed.get("accepted_bundle_keys") or set()
+        resumed_counts = resumed.get("counts") or {}
+        samples = resumed_samples
+        accepted_bundle_keys = set(resumed_keys)
+        for k in ("task1", "task2", "task3", "task4", "bundle"):
+            if k in resumed_counts:
+                counts[k] = int(resumed_counts.get(k) or 0)
+        checkpoint_events = int(resumed.get("checkpoint_events") or 0)
+        last_bundle_key = resumed.get("last_bundle_key")
+
+        rstats = resumed.get("reject_stats")
+        if isinstance(rstats, dict):
+            for k, v in rstats.items():
+                if k in st.REJECT_STATS:
+                    st.REJECT_STATS[k] = int(v or 0)
+        fstats = resumed.get("frame_stats")
+        if isinstance(fstats, dict):
+            for k, v in fstats.items():
+                if k in st.FRAME_STATS:
+                    st.FRAME_STATS[k] = int(v or 0)
+        seed_gemini_error_stats_from_log()
+        st.CHECKPOINT_STATE["events"] = int(checkpoint_events)
+        st.CHECKPOINT_STATE["accepted_bundle_keys"] = int(len(accepted_bundle_keys))
+        st.CHECKPOINT_STATE["last_bundle_key"] = last_bundle_key
+        st.logger.info(
+            "Resume loaded: samples=%d bundles=%d counts=%s last_bundle_key=%s checkpoint_events=%d",
+            len(samples), len(accepted_bundle_keys), json.dumps(counts, sort_keys=True),
+            str(last_bundle_key or ""), checkpoint_events,
+        )
+
+    def _materialize_checkpoint_benchmark(samples_local, counts_local):
+        payload = {
+            "meta": {
+                "dataset": "MVGT",
+                "protocol": "Haozhen-style Gaze-VQA benchmark v7.4 (Single-process)",
+                "run_name": st.RUN_NAME,
+                "run_dir": str(st.RUN_DIR),
+                "checkpoint_materialized": True,
+            },
+            "counts": counts_local,
+            "reject_stats": st.REJECT_STATS,
+            "frame_stats": st.FRAME_STATS,
+            "samples": samples_local,
+        }
+        with open(st.BENCH_JSON, "w") as f:
+            json.dump(payload, f, indent=2)
+
+    def _checkpoint_after_accept(bundle_key, accepted_samples, split_name, seq_name, frame_name):
+        nonlocal checkpoint_events, last_bundle_key
+        append_checkpoint_samples(accepted_samples, bundle_key=bundle_key)
+        append_checkpoint_bundle(
+            bundle_key=bundle_key,
+            split=split_name,
+            seq=seq_name,
+            frame_id=frame_name,
+        )
+        accepted_bundle_keys.add(bundle_key)
+        checkpoint_events += 1
+        last_bundle_key = bundle_key
+        st.CHECKPOINT_STATE["events"] = int(checkpoint_events)
+        st.CHECKPOINT_STATE["accepted_bundle_keys"] = int(len(accepted_bundle_keys))
+        st.CHECKPOINT_STATE["last_bundle_key"] = bundle_key
+        if checkpoint_events % st.CHECKPOINT_EVERY_N_ACCEPTS == 0:
+            write_resume_state(
+                counts=counts,
+                sample_count=len(samples),
+                accepted_bundle_count=len(accepted_bundle_keys),
+                last_bundle_key=bundle_key,
+                checkpoint_events=checkpoint_events,
+            )
+            if (
+                checkpoint_events // st.CHECKPOINT_EVERY_N_ACCEPTS
+            ) % st.MATERIALIZE_BENCHMARK_EVERY_N_CHECKPOINTS == 0:
+                _materialize_checkpoint_benchmark(samples, counts)
 
     with zipfile.ZipFile(st.LOCAL_ZIP_PATH, "r") as zf:
         seqs = zip_list_sequences(zf)
@@ -228,7 +318,10 @@ def generate_benchmark_single():
                 st.FRAME_STATS["frames_seen"] += 1
 
                 frame_id = fr["frame_id"]
-                st.CURRENT_FRAME_KEY = f"{split}/{seq}/{frame_id}"
+                bundle_key = checkpoint_bundle_key(split, seq, frame_id)
+                st.CURRENT_FRAME_KEY = bundle_key
+                if st.REQUIRE_ALL_TASKS_PER_FRAME and bundle_key in accepted_bundle_keys:
+                    continue
                 frame_data = fr["data"]
                 cams = detect_cameras(frame_data)
                 if not cams:
@@ -341,6 +434,13 @@ def generate_benchmark_single():
                     counts["task3"] += 1
                     counts["task4"] += 1
                     counts["bundle"] += 1
+                    _checkpoint_after_accept(
+                        bundle_key=bundle_key,
+                        accepted_samples=[t1, t2, t3, t4],
+                        split_name=split,
+                        seq_name=seq,
+                        frame_name=frame_id,
+                    )
                     t1_accepted = t2_accepted = t3_accepted = t4_accepted = True
                     if split_l in split_counts:
                         split_counts[split_l]["task1"] += 1
@@ -496,6 +596,21 @@ def generate_benchmark_single():
                 break
 
     st.CURRENT_FRAME_KEY = None
+    write_resume_state(
+        counts=counts,
+        sample_count=len(samples),
+        accepted_bundle_count=len(accepted_bundle_keys),
+        last_bundle_key=last_bundle_key,
+        checkpoint_events=checkpoint_events,
+    )
+    write_run_status(
+        "running",
+        reason="finalizing_outputs",
+        extra={
+            "checkpoint_events": checkpoint_events,
+            "accepted_bundle_keys": len(accepted_bundle_keys),
+        },
+    )
 
     vlm_usage_report = get_vlm_usage_report()
     vlm_usage_path = None
@@ -509,6 +624,9 @@ def generate_benchmark_single():
     )
     if teacher_verifier_path:
         st.logger.info(f"Saved Gemini teacher/verifier report: {teacher_verifier_path}")
+    gemini_error_summary_path = write_gemini_error_summary()
+    if gemini_error_summary_path:
+        st.logger.info(f"Saved Gemini error summary: {gemini_error_summary_path}")
 
     bundle_skip_stats = None
     if st.REQUIRE_ALL_TASKS_PER_FRAME:
@@ -551,6 +669,16 @@ def generate_benchmark_single():
             "bundle_skip_stats": bundle_skip_stats,
             "gemini_teacher_verifier_report": teacher_verifier_path,
             "gemini_teacher_verifier_summary": teacher_verifier_summary,
+            "gemini_error_log": str(st.GEMINI_ERROR_LOG_JSONL),
+            "gemini_error_summary": gemini_error_summary_path,
+            "resume": {
+                "enabled": bool(st.RESUME_ENABLED),
+                "checkpoint_every_n_accepts": int(st.CHECKPOINT_EVERY_N_ACCEPTS),
+                "materialize_benchmark_every_n_checkpoints": int(st.MATERIALIZE_BENCHMARK_EVERY_N_CHECKPOINTS),
+                "accepted_bundle_keys": len(accepted_bundle_keys),
+                "checkpoint_events": checkpoint_events,
+                "last_bundle_key": last_bundle_key,
+            },
         },
         "counts": counts,
         "reject_stats": st.REJECT_STATS,
@@ -605,13 +733,28 @@ def generate_benchmark_single():
         if v > 0:
             st.logger.info(f"{k}: {v}")
 
+    write_run_status(
+        "completed",
+        reason="success",
+        extra={
+            "counts": counts,
+            "accepted_bundle_keys": len(accepted_bundle_keys),
+            "checkpoint_events": checkpoint_events,
+        },
+    )
+
     return st.BENCH_JSON
 
 
 def main():
     try:
         generate_benchmark_single()
-    except Exception:
+    except Exception as e:
+        try:
+            write_run_status("failed", reason=str(e)[:300])
+            write_gemini_error_summary()
+        except Exception:
+            pass
         st.REJECT_STATS["exceptions"] += 1
         st.logger.error("FATAL ERROR:\n" + traceback.format_exc())
         raise

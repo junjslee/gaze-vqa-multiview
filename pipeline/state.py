@@ -140,7 +140,7 @@ def parse_args():
                           default=int(os.environ.get("GEMINI_THINKING_BUDGET", "0")),
                           help="Gemini thinking budget (tokens). Use 0 to disable thinking for short-label stability.")
     g_models.add_argument("--vlm_timeout_s", type=float,
-                          default=float(os.environ.get("VLM_TIMEOUT_S", "90")),
+                          default=float(os.environ.get("VLM_TIMEOUT_S", "150")),
                           help="Timeout (seconds) for external API VLM calls.")
     # Optional pricing overrides used by usage-cost reporting.
     g_models.add_argument("--openai_price_input_per_1m", type=float,
@@ -197,6 +197,21 @@ def parse_args():
                          help="Scan full dataset to report total frames/points (default: on).")
     g_scope.add_argument("--no_scan_dataset_stats", action="store_true", default=False,
                          help="Disable full dataset stats scan.")
+
+    # -------------------------------------------------------------------------
+    # Resume / checkpoints / robustness
+    # -------------------------------------------------------------------------
+    g_resume = p.add_argument_group("Resume / checkpoints / robustness")
+    g_resume.add_argument("--resume_from_run_dir", type=str, default="",
+                          help="Resume from an existing run dir (loads checkpoints + accepted samples).")
+    g_resume.add_argument("--checkpoint_every_n_accepts", type=int, default=1,
+                          help="Write resume state every N accepted frame bundles.")
+    g_resume.add_argument("--materialize_benchmark_every_n_checkpoints", type=int, default=10,
+                          help="Write benchmark_gazevqa.json every N checkpoint-state writes.")
+    g_resume.add_argument("--strict_gemini_success_required", action="store_true", default=True,
+                          help="Reject frames when Task1/Task4 Gemini calls fail or return invalid structured output.")
+    g_resume.add_argument("--disable_strict_gemini_success_required", action="store_true", default=False,
+                          help="Allow fallback behavior when Gemini errors occur.")
 
     # -------------------------------------------------------------------------
     # Performance / memory
@@ -297,7 +312,7 @@ def parse_args():
     g_task.add_argument("--task1_teacher_min_conf", type=str, default="MEDIUM",
                         choices=["LOW", "MEDIUM", "HIGH"],
                         help="Minimum confidence for applying teacher-selected Task1 labels.")
-    g_task.add_argument("--task1_teacher_temperature", type=float, default=0.2,
+    g_task.add_argument("--task1_teacher_temperature", type=float, default=1.0,
                         help="Temperature used in Task1 teacher calls.")
     g_task.add_argument("--task1_teacher_max_new_tokens", type=int, default=512,
                         help="Token budget for Task1 teacher responses.")
@@ -383,7 +398,7 @@ def parse_args():
                         help="Keep Task4 sample when verifier disagreement confidence is below flip threshold.")
     g_task.add_argument("--task4_gemini_verifier_max_new_tokens", type=int, default=192,
                         help="Token budget for Task4 Gemini verifier responses.")
-    g_task.add_argument("--task4_gemini_verifier_temperature", type=float, default=0.2,
+    g_task.add_argument("--task4_gemini_verifier_temperature", type=float, default=1.0,
                         help="Temperature used by Task4 Gemini verifier.")
     g_task.add_argument("--task4_gemini_verifier_thinking_level", type=str, default="low",
                         choices=["minimal", "low", "medium", "high"],
@@ -456,6 +471,8 @@ if ARGS.task4_disable_gemini_verifier_structured_json:
     ARGS.task4_gemini_verifier_structured_json = False
 if ARGS.task4_disable_gemini_verifier_retry_on_partial_json:
     ARGS.task4_gemini_verifier_retry_on_partial_json = False
+if ARGS.disable_strict_gemini_success_required:
+    ARGS.strict_gemini_success_required = False
 if ARGS.task1_seg_preset == "clahe_bilateral":
     ARGS.task1_seg_bilateral = True
 elif ARGS.task1_seg_preset == "clahe_bilateral_edge":
@@ -501,9 +518,14 @@ def _slugify_model_for_run_name(model_name, max_len=80):
 _RESOLVED_VLM_MODEL_ID = _resolve_vlm_model_id(ARGS)
 _RUN_MODEL_SUFFIX = _slugify_model_for_run_name(_RESOLVED_VLM_MODEL_ID)
 
-RUN_NAME = ARGS.run_name.strip() or f"run_{now_str()}_v4_{_RUN_MODEL_SUFFIX}"
 OUT_ROOT = Path(ARGS.out_root).resolve()
-RUN_DIR = OUT_ROOT / "runs" / RUN_NAME
+RESUME_FROM_RUN_DIR = str(ARGS.resume_from_run_dir or "").strip()
+if RESUME_FROM_RUN_DIR:
+    RUN_DIR = Path(RESUME_FROM_RUN_DIR).expanduser().resolve()
+    RUN_NAME = RUN_DIR.name
+else:
+    RUN_NAME = ARGS.run_name.strip() or f"run_{now_str()}_v4_{_RUN_MODEL_SUFFIX}"
+    RUN_DIR = OUT_ROOT / "runs" / RUN_NAME
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 
 RAW_IMG_DIR = RUN_DIR / "images_raw"
@@ -515,18 +537,30 @@ DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR = RUN_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+CHECKPOINT_DIR = RUN_DIR / "checkpoints"
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
 BENCH_JSON = RUN_DIR / "benchmark_gazevqa.json"
+SNAPSHOT_JSON = RUN_DIR / "snapshot_progress.json"
 DEBUG_MANIFEST = DEBUG_DIR / "debug_manifest.jsonl"
 RUN_LOG = LOG_DIR / "run.log"
 CONFIG_JSON = RUN_DIR / "run_config.json"
 VLM_USAGE_JSON = RUN_DIR / "vlm_usage_report.json"
 GEMINI_TEACHER_VERIFIER_REPORT_JSON = RUN_DIR / "gemini_teacher_verifier_report.json"
+CHECKPOINT_ACCEPTED_SAMPLES_JSONL = CHECKPOINT_DIR / "accepted_samples.jsonl"
+CHECKPOINT_ACCEPTED_BUNDLES_JSONL = CHECKPOINT_DIR / "accepted_bundles.jsonl"
+CHECKPOINT_STATE_JSON = CHECKPOINT_DIR / "resume_state.json"
+RUN_STATUS_JSON = RUN_DIR / "run_status.json"
+GEMINI_ERROR_LOG_JSONL = LOG_DIR / "gemini_errors.jsonl"
+GEMINI_ERROR_SUMMARY_JSON = LOG_DIR / "gemini_errors_summary.json"
+
+_LOG_FILE_MODE = "a" if RESUME_FROM_RUN_DIR else "w"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[
-        logging.FileHandler(RUN_LOG, mode="w"),
+        logging.FileHandler(RUN_LOG, mode=_LOG_FILE_MODE),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -534,12 +568,15 @@ logger = logging.getLogger("gazevqa")
 
 logger.info("=== Gaze-VQA Builder v7.4 (Single-process) ===")
 logger.info(f"Run dir: {RUN_DIR}")
+if RESUME_FROM_RUN_DIR:
+    logger.info(f"Resume mode enabled from: {RUN_DIR}")
 
 with open(CONFIG_JSON, "w") as f:
     json.dump({
         "run_name": RUN_NAME,
         "out_root": str(OUT_ROOT),
         "run_dir": str(RUN_DIR),
+        "resume_from_run_dir": RESUME_FROM_RUN_DIR or None,
         "args": vars(ARGS),
     }, f, indent=2)
 
@@ -593,6 +630,10 @@ SAVE_DEBUG = bool(ARGS.save_debug)
 DEBUG_EVERY_N_TASK1 = int(ARGS.debug_every_n_task1)
 MAX_VIEWS = int(ARGS.max_views)
 THREAD_IO = int(ARGS.thread_io)
+RESUME_ENABLED = bool(RESUME_FROM_RUN_DIR)
+CHECKPOINT_EVERY_N_ACCEPTS = max(1, int(ARGS.checkpoint_every_n_accepts))
+MATERIALIZE_BENCHMARK_EVERY_N_CHECKPOINTS = max(1, int(ARGS.materialize_benchmark_every_n_checkpoints))
+STRICT_GEMINI_SUCCESS_REQUIRED = bool(ARGS.strict_gemini_success_required)
 REQUIRE_ALL_TASKS_PER_FRAME = bool(ARGS.require_all_tasks)
 TASK1_CONF_THRESHOLD = float(ARGS.task1_conf_threshold)
 
@@ -769,6 +810,7 @@ REJECT_STATS = {
     "t1_teacher_conflict": 0,
     "t1_teacher_parse_fail": 0,
     "t1_teacher_partial_retry": 0,
+    "t1_gemini_error": 0,
 
     "t2_no_tri": 0,
     "t2_no_cam_centers": 0,
@@ -789,11 +831,13 @@ REJECT_STATS = {
     "t4_no_visibility": 0,
     "t4_gemini_verify_flip": 0,
     "t4_gemini_verify_reject": 0,
+    "t4_gemini_error": 0,
     "frame_missing_task1": 0,
     "frame_missing_task2": 0,
     "frame_missing_task3": 0,
     "frame_missing_task4": 0,
     "frame_incomplete_bundle": 0,
+    "gemini_error_events": 0,
 
     "exceptions": 0,
 }
@@ -809,6 +853,18 @@ FRAME_STATS = {
 }
 
 DATASET_STATS = {}
+GEMINI_ERROR_STATS = {
+    "total": 0,
+    "by_task": {},
+    "by_stage": {},
+    "by_type": {},
+    "by_model": {},
+}
+CHECKPOINT_STATE = {
+    "events": 0,
+    "accepted_bundle_keys": 0,
+    "last_bundle_key": None,
+}
 
 TASK2_DIST_STATS = {
     "seen": 0,

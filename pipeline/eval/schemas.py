@@ -135,8 +135,11 @@ class CampaignMeta:
     model_map: Dict[str, Dict[str, Any]]
     container_sif: str
     slurm: Dict[str, Any]
+    base_manifest_path: Optional[str] = None
+    active_manifest_path: Optional[str] = None
+    active_manifest_sha256: Optional[str] = None
+    review: Optional[Dict[str, Any]] = None
     notes: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
-

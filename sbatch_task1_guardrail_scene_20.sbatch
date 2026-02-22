@@ -100,6 +100,7 @@ RUN_NAME="${RUN_STAMP}_${SCRIPT_TAG}_qwen_teacher_task4verifier"
 TASK1_TEACHER_MODEL="${TASK1_TEACHER_MODEL:-gemini-3-flash-preview}"
 TASK4_VERIFIER_MODEL="${TASK4_VERIFIER_MODEL:-gemini-3-flash-preview}"
 GEMINI_FALLBACK_MODELS="${GEMINI_FALLBACK_MODELS:-gemini-2.5-flash,gemini-2.0-flash,gemini-1.5-flash}"
+VLM_TIMEOUT_S="${VLM_TIMEOUT_S:-150}"
 export GEMINI_FALLBACK_MODELS
 
 echo
@@ -115,11 +116,12 @@ run_python "${ROOT}/generate_benchmark_delta.py" \
   --task1_teacher_final \
   --task1_teacher_provider gemini \
   --task1_teacher_model "${TASK1_TEACHER_MODEL}" \
+  --vlm_timeout_s "${VLM_TIMEOUT_S}" \
   --task1_teacher_force_call \
   --task1_teacher_max_calls 2 \
   --task1_teacher_second_call_on_mismatch \
   --task1_teacher_min_conf MEDIUM \
-  --task1_teacher_temperature 0.2 \
+  --task1_teacher_temperature 1.0 \
   --task1_teacher_max_new_tokens 512 \
   --task1_teacher_gemini_thinking_level medium \
   --task1_teacher_gemini_thinking_budget 64 \
@@ -132,7 +134,7 @@ run_python "${ROOT}/generate_benchmark_delta.py" \
   --task4_gemini_verifier_min_flip_conf HIGH \
   --task4_gemini_verifier_reject_on_uncertain_conflict \
   --task4_gemini_verifier_max_new_tokens 192 \
-  --task4_gemini_verifier_temperature 0.2 \
+  --task4_gemini_verifier_temperature 1.0 \
   --task4_gemini_verifier_thinking_level low \
   --task4_gemini_verifier_thinking_budget 32 \
   --task4_gemini_verifier_media_resolution high \

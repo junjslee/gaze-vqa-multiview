@@ -10,7 +10,7 @@ from .engines.vllm_client import VLLMClient
 from .model_registry import ModelSpec
 from .providers.gemini_api import infer_gemini_multimodal
 from .providers.openai_api import infer_openai_multimodal
-from .schemas import PredictionRecord, append_jsonl, iter_jsonl, read_json, utc_now_iso, write_json
+from .schemas import PredictionRecord, append_jsonl, file_sha256, iter_jsonl, read_json, utc_now_iso, write_json
 
 SYSTEM_PROMPT = (
     "You are an expert assistant for multi-camera gaze and accessibility reasoning. "
@@ -77,6 +77,26 @@ def _load_manifest(path: Path) -> List[Dict[str, Any]]:
     return list(iter_jsonl(path))
 
 
+def _resolve_manifest_path(campaign_dir: Path) -> Path:
+    campaign_dir = campaign_dir.resolve()
+    meta_path = campaign_dir / "campaign_meta.json"
+    if meta_path.exists():
+        meta = read_json(meta_path)
+        for key in ("active_manifest_path", "gt_manifest_path"):
+            raw = str(meta.get(key) or "").strip()
+            if not raw:
+                continue
+            p = Path(raw)
+            if not p.is_absolute():
+                p = (campaign_dir / p).resolve()
+            if p.exists():
+                return p
+    fallback = campaign_dir / "gt" / "gt_manifest_v1.jsonl"
+    if fallback.exists():
+        return fallback.resolve()
+    raise FileNotFoundError(f"Missing frozen GT manifest under campaign: {campaign_dir}")
+
+
 def _processed_ids(predictions_path: Path) -> set[str]:
     done = set()
     for row in iter_jsonl(predictions_path):
@@ -92,6 +112,49 @@ def _choose_engine_client(engine: str, base_url: str, api_key: str, timeout_s: f
     if engine == "vllm":
         return VLLMClient(base_url=base_url, api_key=api_key, timeout_s=timeout_s)
     raise ValueError(f"Unsupported engine client type: {engine}")
+
+
+def _redact_runtime(runtime: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(runtime or {})
+    for k in ("openai_api_key", "gemini_api_key", "server_api_key"):
+        if k in out and str(out[k]):
+            out[k] = "***REDACTED***"
+    return out
+
+
+def _openai_package_available() -> bool:
+    try:
+        import openai  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _gemini_package_available() -> bool:
+    try:
+        from google import genai  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _fatal_api_error_reason(error_text: str) -> str:
+    e = str(error_text or "").strip().lower()
+    if not e:
+        return ""
+    if "insufficient_quota" in e:
+        return "insufficient_quota"
+    if "resource_exhausted" in e and "quota" in e:
+        return "resource_exhausted_quota"
+    if "quota" in e and ("exceed" in e or "limit" in e or "billing" in e):
+        return "quota_or_billing_limit"
+    if "invalid api key" in e or "incorrect api key" in e:
+        return "invalid_api_key"
+    if "unauthorized" in e or "authentication" in e or "permission denied" in e:
+        return "auth_or_permission_error"
+    if "package is required" in e or "no module named" in e:
+        return "missing_api_package"
+    return ""
 
 
 def _engine_infer(
@@ -145,9 +208,11 @@ def run_inference_for_model(
     campaign_dir: Path,
     model_spec: ModelSpec,
     runtime: Optional[Dict[str, Any]] = None,
+    reset_predictions: bool = False,
 ) -> Dict[str, Any]:
     runtime = runtime or {}
-    manifest_path = campaign_dir / "gt" / "gt_manifest_v1.jsonl"
+    runtime_safe = _redact_runtime(runtime)
+    manifest_path = _resolve_manifest_path(campaign_dir)
     if not manifest_path.exists():
         raise FileNotFoundError(f"Missing frozen GT manifest: {manifest_path}")
 
@@ -155,6 +220,11 @@ def run_inference_for_model(
     predictions_dir.mkdir(parents=True, exist_ok=True)
     pred_path = predictions_dir / f"{model_spec.key}.jsonl"
     run_meta_path = predictions_dir / f"{model_spec.key}.meta.json"
+    if reset_predictions:
+        if pred_path.exists():
+            pred_path.unlink()
+        if run_meta_path.exists():
+            run_meta_path.unlink()
 
     manifest = _load_manifest(manifest_path)
     processed = _processed_ids(pred_path)
@@ -163,6 +233,8 @@ def run_inference_for_model(
     vllm_url = str(runtime.get("vllm_base_url", "http://127.0.0.1:8000")).strip()
     server_api_key = str(runtime.get("server_api_key", "")).strip()
     timeout_s = float(runtime.get("server_timeout_s", 180.0))
+    request_interval = max(0.0, float(runtime.get("request_interval", 0.0)))
+    abort_on_fatal_api_error = bool(runtime.get("abort_on_fatal_api_error", True))
 
     primary_client = None
     fallback_client = None
@@ -187,8 +259,12 @@ def run_inference_for_model(
     unavailable_reason = ""
     if model_spec.engine == "openai_api" and not str(runtime.get("openai_api_key", "")).strip():
         unavailable_reason = "missing_openai_api_key"
+    elif model_spec.engine == "openai_api" and not _openai_package_available():
+        unavailable_reason = "missing_openai_package"
     elif model_spec.engine == "gemini_api" and not str(runtime.get("gemini_api_key", "")).strip():
         unavailable_reason = "missing_gemini_api_key"
+    elif model_spec.engine == "gemini_api" and not _gemini_package_available():
+        unavailable_reason = "missing_gemini_package"
     elif model_spec.engine in {"sglang", "vllm"}:
         primary_ok = bool(primary_client and primary_client.healthcheck())
         fallback_ok = bool(fallback_client and fallback_client.healthcheck())
@@ -208,7 +284,10 @@ def run_inference_for_model(
             "newly_processed": 0,
             "errors_in_new_rows": 0,
             "elapsed_s": 0.0,
-            "runtime": runtime,
+            "runtime": runtime_safe,
+            "reset_predictions": bool(reset_predictions),
+            "manifest_path": str(manifest_path),
+            "manifest_sha256": file_sha256(manifest_path),
             "unavailable_reason": unavailable_reason,
             "updated_at": utc_now_iso(),
         }
@@ -218,6 +297,7 @@ def run_inference_for_model(
     total = len(manifest)
     newly_processed = 0
     error_count = 0
+    early_stop_reason = ""
     start = time.time()
 
     for sample in manifest:
@@ -280,6 +360,15 @@ def run_inference_for_model(
         if error:
             error_count += 1
 
+        if abort_on_fatal_api_error and model_spec.engine in {"openai_api", "gemini_api"} and error:
+            fatal_reason = _fatal_api_error_reason(error)
+            if fatal_reason:
+                early_stop_reason = f"fatal_api_error:{fatal_reason}"
+                break
+
+        if request_interval > 0.0 and model_spec.engine in {"openai_api", "gemini_api"}:
+            time.sleep(request_interval)
+
     elapsed = time.time() - start
     meta = {
         "model_key": model_spec.key,
@@ -293,8 +382,14 @@ def run_inference_for_model(
         "predictions_file": str(pred_path),
         "newly_processed": newly_processed,
         "errors_in_new_rows": error_count,
+        "stopped_early": bool(early_stop_reason),
+        "early_stop_reason": early_stop_reason or None,
+        "remaining_unprocessed": max(0, total - len(processed)),
         "elapsed_s": round(elapsed, 3),
-        "runtime": runtime,
+        "runtime": runtime_safe,
+        "reset_predictions": bool(reset_predictions),
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": file_sha256(manifest_path),
         "updated_at": utc_now_iso(),
     }
     write_json(run_meta_path, meta)
@@ -329,7 +424,7 @@ def merge_predictions_for_samples(
 
 
 def build_judge_input(campaign_dir: Path, model_key: str) -> Path:
-    manifest_path = campaign_dir / "gt" / "gt_manifest_v1.jsonl"
+    manifest_path = _resolve_manifest_path(campaign_dir)
     pred_path = campaign_dir / "predictions" / f"{model_key}.jsonl"
     out_path = campaign_dir / "judge" / f"{model_key}.judge_input.json"
 

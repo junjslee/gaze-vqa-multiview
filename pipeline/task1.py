@@ -18,9 +18,9 @@ from .sam2_utils import (
     draw_dot_on_crop,
     mask_person_overlap_ratio,
 )
-from .vlm import vlm_generate, strict_noun_phrase, _first_two_sentences, clean_label, choose_by_letter
+from .vlm import vlm_generate, strict_noun_phrase, _first_two_sentences, clean_label, choose_by_letter, classify_gemini_error
 from . import prompts
-from .utils import _resize, make_id, log_debug
+from .utils import _resize, make_id, log_debug, log_gemini_error
 
 
 def draw_gaze_ray_overlay(im, anno_scaled):
@@ -3033,6 +3033,20 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                         )
                     except Exception as e:
                         st.logger.warning(f"[Task1] teacher pass1 failed; fallback to student label: {e}")
+                        log_gemini_error({
+                            "task_id": 1,
+                            "stage": "task1_teacher_pass1_request",
+                            "error_type": classify_gemini_error(e),
+                            "message": str(e),
+                            "split": split,
+                            "seq": seq,
+                            "frame_id": frame_id,
+                            "anchor_cam": anchor_cam,
+                            "model_requested": str(getattr(st, "TASK1_TEACHER_MODEL", "")).strip() or "provider_default",
+                        })
+                        if bool(getattr(st, "STRICT_GEMINI_SUCCESS_REQUIRED", True)):
+                            st.REJECT_STATS["t1_teacher_parse_fail"] += 1
+                            return None
                         tpass1 = {
                             "final_label": None,
                             "confidence": "LOW",
@@ -3053,6 +3067,22 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                     teacher_final["call_count"] = 1
                     if not bool(tpass1.get("parse_ok")):
                         st.REJECT_STATS["t1_teacher_parse_fail"] += 1
+                        log_gemini_error({
+                            "task_id": 1,
+                            "stage": "task1_teacher_pass1_parse",
+                            "error_type": "parse_fail",
+                            "message": str(tpass1.get("parse_reason") or "pass1_parse_fail"),
+                            "split": split,
+                            "seq": seq,
+                            "frame_id": frame_id,
+                            "anchor_cam": anchor_cam,
+                            "model_requested": str(tpass1.get("model_requested") or getattr(st, "TASK1_TEACHER_MODEL", "")).strip() or "provider_default",
+                            "model": str(tpass1.get("model") or ""),
+                            "gemini_api_version": str(tpass1.get("gemini_api_version") or ""),
+                            "gemini_mode": str(tpass1.get("gemini_mode") or ""),
+                        })
+                        if bool(getattr(st, "STRICT_GEMINI_SUCCESS_REQUIRED", True)):
+                            return None
                     if int(tpass1.get("retry_count") or 0) > 0:
                         st.REJECT_STATS["t1_teacher_partial_retry"] += 1
                     t1_label = _sanitize_label(tpass1.get("final_label"))
@@ -3097,6 +3127,20 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                             )
                         except Exception as e:
                             st.logger.warning(f"[Task1] teacher pass2 failed; keeping prior selection: {e}")
+                            log_gemini_error({
+                                "task_id": 1,
+                                "stage": "task1_teacher_pass2_request",
+                                "error_type": classify_gemini_error(e),
+                                "message": str(e),
+                                "split": split,
+                                "seq": seq,
+                                "frame_id": frame_id,
+                                "anchor_cam": anchor_cam,
+                                "model_requested": str(getattr(st, "TASK1_TEACHER_MODEL", "")).strip() or "provider_default",
+                            })
+                            if bool(getattr(st, "STRICT_GEMINI_SUCCESS_REQUIRED", True)):
+                                st.REJECT_STATS["t1_teacher_parse_fail"] += 1
+                                return None
                             tpass2 = {
                                 "final_label": None,
                                 "confidence": "LOW",
@@ -3116,6 +3160,22 @@ def build_task1(zf, split, seq, frame_id, cams, per_cam, task1_index):
                         teacher_final["call_count"] = 2
                         if not bool(tpass2.get("parse_ok")):
                             st.REJECT_STATS["t1_teacher_parse_fail"] += 1
+                            log_gemini_error({
+                                "task_id": 1,
+                                "stage": "task1_teacher_pass2_parse",
+                                "error_type": "parse_fail",
+                                "message": str(tpass2.get("parse_reason") or "pass2_parse_fail"),
+                                "split": split,
+                                "seq": seq,
+                                "frame_id": frame_id,
+                                "anchor_cam": anchor_cam,
+                                "model_requested": str(tpass2.get("model_requested") or getattr(st, "TASK1_TEACHER_MODEL", "")).strip() or "provider_default",
+                                "model": str(tpass2.get("model") or ""),
+                                "gemini_api_version": str(tpass2.get("gemini_api_version") or ""),
+                                "gemini_mode": str(tpass2.get("gemini_mode") or ""),
+                            })
+                            if bool(getattr(st, "STRICT_GEMINI_SUCCESS_REQUIRED", True)):
+                                return None
                         if int(tpass2.get("retry_count") or 0) > 0:
                             st.REJECT_STATS["t1_teacher_partial_retry"] += 1
                         t2_label = _sanitize_label(tpass2.get("final_label"))

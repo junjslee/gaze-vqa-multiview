@@ -387,6 +387,30 @@ def _is_transient_api_error_message(msg):
     return False
 
 
+def classify_gemini_error(err):
+    s = str(err or "")
+    su = s.upper()
+    if (
+        "RESOURCE_EXHAUSTED" in su
+        or "INSUFFICIENT" in su
+        or "QUOTA" in su
+        or "BILLING" in su
+        or "FREE TRIAL" in su
+    ):
+        return "quota"
+    if "PERMISSION_DENIED" in su or "API ERROR 401" in su or "API ERROR 403" in su:
+        return "auth"
+    if "API ERROR 404" in su or "NOT_FOUND" in su:
+        return "not_found"
+    if "READ TIMED OUT" in su or _is_transient_api_error_message(s):
+        return "transient"
+    return "unknown"
+
+
+def is_gemini_hard_error(err):
+    return classify_gemini_error(err) in {"quota", "auth", "not_found"}
+
+
 def _post_json(url, headers, payload, provider_name):
     max_attempts = _retry_max_attempts()
     backoff_s = _retry_backoff_seconds()

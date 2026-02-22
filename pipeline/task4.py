@@ -29,9 +29,9 @@ from .task1 import (
     _synthesize_multiview_labels,
 )
 from .task3 import object_visible_yesno_vlm
-from .vlm import vlm_generate, safe_reasoning, choose_by_letter
+from .vlm import vlm_generate, safe_reasoning, choose_by_letter, classify_gemini_error
 from . import prompts
-from .utils import _resize, make_id, log_debug
+from .utils import _resize, make_id, log_debug, log_gemini_error
 
 
 def verify_reasoning_with_pixels(images, answer_yesno, explanation, obj_phrase, person_desc, scene_type=None):
@@ -966,6 +966,17 @@ def build_task4_accessibility_grounded_to_task1(
             )
         except Exception as e:
             st.logger.warning(f"[Task4] Gemini visibility verifier failed; rejecting sample: {e}")
+            log_gemini_error({
+                "task_id": 4,
+                "stage": "task4_verifier_request",
+                "error_type": classify_gemini_error(e),
+                "message": str(e),
+                "split": split,
+                "seq": seq,
+                "frame_id": frame_id,
+                "query_cam": query_cam,
+                "model_requested": str(getattr(st, "TASK4_GEMINI_VERIFIER_MODEL", "")).strip() or "provider_default",
+            })
             vrec = {
                 "prediction": None,
                 "presence": None,
@@ -1010,29 +1021,53 @@ def build_task4_accessibility_grounded_to_task1(
         gconf = str(vrec.get("confidence") or "LOW").upper()
         min_flip_conf = str(getattr(st, "TASK4_GEMINI_VERIFIER_MIN_FLIP_CONF", "HIGH")).upper()
         reject_on_uncertain = bool(getattr(st, "TASK4_GEMINI_VERIFIER_REJECT_ON_UNCERTAIN_CONFLICT", True))
-        if (not bool(vrec.get("parse_ok"))) or gpred not in {"YES", "NO"} or gpresence not in {"PRESENT", "NOT_PRESENT", "UNCLEAR"} or gperson_presence not in {"PRESENT", "NOT_PRESENT", "UNCLEAR"}:
-            gemini_verifier["action"] = "reject"
-            st.REJECT_STATS["t4_gemini_verify_reject"] += 1
-            st.REJECT_STATS["t4_gemini_verifier_parse_fail"] += 1
-            st.REJECT_STATS["t4_verifier_fail"] += 1
-            log_debug({
-                "task": 4,
+        parse_invalid = (
+            (not bool(vrec.get("parse_ok")))
+            or gpred not in {"YES", "NO"}
+            or gpresence not in {"PRESENT", "NOT_PRESENT", "UNCLEAR"}
+            or gperson_presence not in {"PRESENT", "NOT_PRESENT", "UNCLEAR"}
+        )
+        if parse_invalid:
+            log_gemini_error({
+                "task_id": 4,
+                "stage": "task4_verifier_parse",
+                "error_type": "parse_fail",
+                "message": str(vrec.get("parse_reason") or "task4_verifier_parse_fail"),
                 "split": split,
                 "seq": seq,
                 "frame_id": frame_id,
-                "person_desc": person_desc,
-                "anchor_cam": anchor_cam,
-                "gaze_target": gaze_target,
                 "query_cam": query_cam,
-                "visibility_gt": v,
-                "queried_object": obj_phrase,
-                "answer": answer,
-                "fail_reason": "task4_gemini_verifier_parse_fail",
-                "task4_gemini_verifier": gemini_verifier,
+                "model_requested": str(vrec.get("model_requested") or getattr(st, "TASK4_GEMINI_VERIFIER_MODEL", "")).strip() or "provider_default",
+                "model": str(vrec.get("model") or ""),
+                "gemini_api_version": str(vrec.get("gemini_api_version") or ""),
+                "gemini_mode": str(vrec.get("gemini_mode") or ""),
             })
-            return None
+            if not bool(getattr(st, "STRICT_GEMINI_SUCCESS_REQUIRED", True)):
+                gemini_verifier["action"] = "keep_non_strict"
+                st.logger.warning("[Task4] Non-strict Gemini mode: keeping current answer despite verifier parse failure.")
+            else:
+                gemini_verifier["action"] = "reject"
+                st.REJECT_STATS["t4_gemini_verify_reject"] += 1
+                st.REJECT_STATS["t4_gemini_verifier_parse_fail"] += 1
+                st.REJECT_STATS["t4_verifier_fail"] += 1
+                log_debug({
+                    "task": 4,
+                    "split": split,
+                    "seq": seq,
+                    "frame_id": frame_id,
+                    "person_desc": person_desc,
+                    "anchor_cam": anchor_cam,
+                    "gaze_target": gaze_target,
+                    "query_cam": query_cam,
+                    "visibility_gt": v,
+                    "queried_object": obj_phrase,
+                    "answer": answer,
+                    "fail_reason": "task4_gemini_verifier_parse_fail",
+                    "task4_gemini_verifier": gemini_verifier,
+                })
+                return None
 
-        if gperson_presence == "NOT_PRESENT":
+        if (not parse_invalid) and gperson_presence == "NOT_PRESENT":
             gemini_verifier["action"] = "reject_person_not_present"
             st.REJECT_STATS["t4_gemini_verify_reject"] += 1
             st.REJECT_STATS["t4_gemini_verifier_person_not_present"] += 1
@@ -1054,7 +1089,7 @@ def build_task4_accessibility_grounded_to_task1(
             })
             return None
 
-        if gpresence == "NOT_PRESENT" and answer == "YES":
+        if (not parse_invalid) and gpresence == "NOT_PRESENT" and answer == "YES":
             st.REJECT_STATS["t4_gemini_verifier_presence_conflict"] += 1
             if _task4_conf_rank(gconf) >= _task4_conf_rank(min_flip_conf):
                 answer = "NO"
@@ -1082,7 +1117,7 @@ def build_task4_accessibility_grounded_to_task1(
                 })
                 return None
 
-        if gpresence == "NOT_PRESENT" and gpred == "YES":
+        if (not parse_invalid) and gpresence == "NOT_PRESENT" and gpred == "YES":
             st.REJECT_STATS["t4_gemini_verifier_presence_conflict"] += 1
             gemini_verifier["action"] = "reject"
             st.REJECT_STATS["t4_gemini_verify_reject"] += 1
@@ -1104,7 +1139,7 @@ def build_task4_accessibility_grounded_to_task1(
             })
             return None
 
-        if gpred in {"YES", "NO"} and gpred != answer:
+        if (not parse_invalid) and gpred in {"YES", "NO"} and gpred != answer:
             min_flip_conf = str(getattr(st, "TASK4_GEMINI_VERIFIER_MIN_FLIP_CONF", "HIGH")).upper()
             if _task4_conf_rank(gconf) >= _task4_conf_rank(min_flip_conf):
                 answer = gpred
