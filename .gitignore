@@ -9,7 +9,7 @@ workflow_diagrams.md
 .env.*
 !.env.example
 .sbatch
-/draft_of_evaluation
+/legacy_eval_metrics
 /data_review_thru_human_in_the_loop
 /tmp_eval_smoke_*/
 /tmp_eval_*/

@@ -10,9 +10,15 @@ import numpy as np
 
 def _ensure_evaluator_imports() -> None:
     root = Path(__file__).resolve().parents[2]
-    eval_dir = root / "draft_of_evaluation"
-    if str(eval_dir) not in sys.path:
-        sys.path.insert(0, str(eval_dir))
+    candidate_dirs = [
+        root / "legacy_eval_metrics",
+        root / "draft_of_evaluation",  # backward compatibility for older local setups
+    ]
+    for eval_dir in candidate_dirs:
+        if eval_dir.exists():
+            if str(eval_dir) not in sys.path:
+                sys.path.insert(0, str(eval_dir))
+            break
 
 
 def _normalize_text(x: Any) -> str:
@@ -106,4 +112,3 @@ def compute_text_metrics(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "errors": [e for e in [sim.get("error"), ngram.get("error")] if e],
         "count": len(preds),
     }
-
