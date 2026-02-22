@@ -12,7 +12,7 @@ This changes scheduling only. Task prompts, gates, and acceptance logic stay unc
 With one Gemini API key and observed transient timeout/503 behavior, 4-way is likely to increase API contention and reduce clean yield. Start with 2-way.
 
 ## Prerequisites
-- `gaze_vqa/sbatch_task1_teacher_scale.sbatch`
+- `gaze_vqa/scripts/sbatch/data_generation/task1/task1_teacher_scale.sbatch`
 - `gaze_vqa/dispatch_task1_teacher_parallel_2way.sh`
 - `gaze_vqa/tools/merge_benchmark_runs.py`
 
@@ -53,7 +53,7 @@ Then submit only the branch you need using the sbatch script directly if preferr
 
 ```bash
 sbatch --export=ALL,SPLITS=Commons,Kitchen,RUN_NAME_SUFFIX=ck,RESUME_RUN_DIR=/work/nvme/bfga/jlee65/gaze_vqa/runs/<run_ck_dir> \
-  gaze_vqa/sbatch_task1_teacher_scale.sbatch
+  gaze_vqa/scripts/sbatch/data_generation/task1/task1_teacher_scale.sbatch
 ```
 
 Rule: never run two jobs against the same run directory.

@@ -48,8 +48,8 @@ python3 gaze_vqa/evaluate_benchmark_delta.py aggregate --campaign campaign_foo
 
 ## Delta/Apptainer scripts
 
-- `gaze_vqa/sbatch_eval_model.sbatch`: one model run.
-- `gaze_vqa/sbatch_eval_campaign.sbatch`: sequential campaign run.
+- `gaze_vqa/scripts/sbatch/eval/eval_model.sbatch`: one model run.
+- `gaze_vqa/scripts/sbatch/eval/eval_campaign.sbatch`: sequential campaign run.
 
 Both scripts default to:
 

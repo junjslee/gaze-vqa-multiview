@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${ROOT:-${SCRIPT_DIR}}"
-SBATCH_SCRIPT="${SBATCH_SCRIPT:-${ROOT}/sbatch_task1_teacher_scale.sbatch}"
+SBATCH_SCRIPT="${SBATCH_SCRIPT:-${ROOT}/scripts/sbatch/data_generation/task1/task1_teacher_scale.sbatch}"
 
 SPLITS_CK="${SPLITS_CK:-Commons,Kitchen}"
 SPLITS_LS="${SPLITS_LS:-Lab,Shop}"
