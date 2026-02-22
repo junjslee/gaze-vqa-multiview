@@ -1,1 +1,0 @@
-scripts/sbatch/eval/eval_model.sbatch

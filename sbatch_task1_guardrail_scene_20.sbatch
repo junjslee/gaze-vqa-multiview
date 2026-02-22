@@ -1,1 +1,0 @@
-scripts/sbatch/data_generation/task1/task1_guardrail_scene_20.sbatch

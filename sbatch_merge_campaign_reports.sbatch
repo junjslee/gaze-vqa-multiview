@@ -1,1 +1,0 @@
-scripts/sbatch/eval/merge_campaign_reports.sbatch

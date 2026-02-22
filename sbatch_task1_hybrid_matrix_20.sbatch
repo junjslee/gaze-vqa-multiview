@@ -1,1 +1,0 @@
-scripts/sbatch/data_generation/task1/task1_hybrid_matrix_20.sbatch
