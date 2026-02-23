@@ -365,11 +365,23 @@ if [[ "${LAUNCH_ENGINE}" == "vllm" ]]; then
     VLLM_ARGS+=(--hf-overrides '{"architectures":["DeepseekVLV2ForCausalLM"]}')
   fi
   if [[ "${USE_APPTAINER}" == "1" ]]; then
-    apptainer exec --nv "${SIF}" vllm serve \
-      "${VLLM_ARGS[@]}" >"${SERVER_LOG}" 2>&1 &
+    if apptainer exec --nv "${SIF}" sh -lc 'command -v vllm >/dev/null 2>&1'; then
+      apptainer exec --nv "${SIF}" vllm serve \
+        "${VLLM_ARGS[@]}" >"${SERVER_LOG}" 2>&1 &
+    else
+      echo "[WARN] vllm executable not found in container PATH; using python -m vllm.entrypoints.cli.main serve."
+      apptainer exec --nv "${SIF}" python3 -m vllm.entrypoints.cli.main serve \
+        "${VLLM_ARGS[@]}" >"${SERVER_LOG}" 2>&1 &
+    fi
   else
-    vllm serve \
-      "${VLLM_ARGS[@]}" >"${SERVER_LOG}" 2>&1 &
+    if command -v vllm >/dev/null 2>&1; then
+      vllm serve \
+        "${VLLM_ARGS[@]}" >"${SERVER_LOG}" 2>&1 &
+    else
+      echo "[WARN] vllm executable not found in host PATH; using python -m vllm.entrypoints.cli.main serve."
+      python3 -m vllm.entrypoints.cli.main serve \
+        "${VLLM_ARGS[@]}" >"${SERVER_LOG}" 2>&1 &
+    fi
   fi
   SERVER_PID=$!
   wait_for_server "http://127.0.0.1:${VLLM_PORT}/v1/models" "${SERVER_READY_RETRIES}" "${SERVER_READY_SLEEP_S}" || {
