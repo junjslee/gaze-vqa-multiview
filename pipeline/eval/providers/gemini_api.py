@@ -46,12 +46,24 @@ def infer_gemini_multimodal(
         with pp.open("rb") as f:
             parts.append(types.Part.from_bytes(data=f.read(), mime_type=_guess_mime(pp)))
 
-    cfg = types.GenerateContentConfig(
-        temperature=float(temperature),
-        top_p=float(top_p),
-        max_output_tokens=int(max_output_tokens),
-        system_instruction=system_prompt or None,
-    )
+    cfg_kwargs = {
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "max_output_tokens": int(max_output_tokens),
+        "system_instruction": system_prompt or None,
+    }
+    thinking_budget_raw = str(os.getenv("GEMINI_THINKING_BUDGET", "0")).strip()
+    if thinking_budget_raw:
+        try:
+            cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=int(thinking_budget_raw))
+        except Exception:
+            # Keep compatibility with older SDK/model combinations.
+            pass
+    try:
+        cfg = types.GenerateContentConfig(**cfg_kwargs)
+    except TypeError:
+        cfg_kwargs.pop("thinking_config", None)
+        cfg = types.GenerateContentConfig(**cfg_kwargs)
 
     last_err = ""
     for attempt in range(1, int(retry) + 1):
@@ -72,4 +84,3 @@ def infer_gemini_multimodal(
                 break
             time.sleep(float(retry_backoff) * attempt)
     return "", {"tokens_in": 0, "tokens_out": 0}, last_err
-

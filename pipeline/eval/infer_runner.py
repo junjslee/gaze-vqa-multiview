@@ -270,6 +270,13 @@ def run_inference_for_model(
         fallback_ok = bool(fallback_client and fallback_client.healthcheck())
         if not primary_ok and not fallback_ok:
             unavailable_reason = f"unhealthy_server:{model_spec.engine}"
+        elif not primary_ok and fallback_ok:
+            # If only fallback is healthy (e.g., FORCE_ENGINE override), use it directly.
+            primary_client = fallback_client
+            fallback_client = None
+        elif primary_ok and not fallback_ok:
+            # Avoid noisy per-sample fallback connection errors when fallback server is down.
+            fallback_client = None
     if unavailable_reason:
         meta = {
             "model_key": model_spec.key,
